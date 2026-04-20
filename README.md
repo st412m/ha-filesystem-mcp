@@ -61,6 +61,15 @@ After the addon starts, your drive will be available at `/media/VAULT/` and will
    ```
 3. Find **Filesystem MCP Server** and click **Install**
 
+## Beta testing (multi-arch)
+
+> 🧪 If you're on Raspberry Pi or other ARM device, try the beta branch which adds aarch64/armv7 support via `BUILD_FROM`.
+
+Add the beta repository instead of the stable one:
+https://github.com/st412m/ha-filesystem-mcp#beta
+
+Please open an [issue](https://github.com/st412m/ha-filesystem-mcp/issues) with your results — architecture, HA version, and whether it worked.
+
 ## Configuration
 
 | Option | Description |
