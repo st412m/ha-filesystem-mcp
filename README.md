@@ -14,6 +14,10 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 - Configurable vault path
 - Auto-creates vault structure and `CLAUDE.md` on first run
 
+## Community
+
+💬 [Discussion thread on Home Assistant Community Forum](https://community.home-assistant.io/t/filesystem-mcp-server-expose-your-local-directory-to-claude-karpathy-llm-wiki-for-home-assistant/)
+
 ## Architecture support
 
 > ⚠️ Currently tested and supported on **amd64 only** (x86-64 servers and mini PCs).
