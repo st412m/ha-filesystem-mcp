@@ -1,4 +1,5 @@
-FROM ghcr.io/home-assistant/amd64-base:3.20
+ARG BUILD_FROM
+FROM ${BUILD_FROM}
 
 RUN apk add --no-cache nodejs npm
 
