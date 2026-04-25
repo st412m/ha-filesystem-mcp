@@ -110,6 +110,8 @@ The addon automatically creates the following structure inside your vault if it 
 
 You can drop files into `raw/` via the Samba share (`\\<your-ha-ip>\VAULT`) from Windows, or via SFTP.
 
+> **Note on `CLAUDE.md`:** The auto-generated `CLAUDE.md` is just a starting point — a minimal template with basic instructions and vault structure. You are expected to customize it over time: add your device inventory, network topology, project context, MCP server constraints, and any rules specific to your setup. The more context you put in `CLAUDE.md`, the more useful Claude becomes across sessions. Think of it as a living document that grows with your smart home.
+
 ## Exposing externally (required for claude.ai)
 
 To connect from claude.ai you need to expose port 3100 via your router.
@@ -156,7 +158,7 @@ And in `secrets.yaml`:
 ```yaml
 # vault_write_url keeps your token out of configuration.yaml and automations.
 # Replace with your HA server's local IP, port 3100, and your addon token.
-vault_write_url: "http://192.168.1.10:3100/private_<your-token>/write"
+vault_write_url: "http://192.168.1.54:3100/private_<your-token>/write"
 ```
 
 Then call it from an automation action:
@@ -197,5 +199,8 @@ server.js (token auth + MCP StreamableHTTP + /write endpoint)
 ```
 
 ## License
+
+MIT
+
 
 MIT
