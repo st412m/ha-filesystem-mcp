@@ -2,7 +2,7 @@
 /**
  * Vault MCP Server — StreamableHTTP транспорт
  * Полная замена supergateway + @modelcontextprotocol/server-filesystem
- * Добавляет: read_pdf_page через синтаксис #N в пути, вывод JPEG
+ * Добавляет: read_pdf_page с поддержкой векторных PDF через SVG
  */
 
 const http = require('http');
@@ -375,7 +375,25 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
+  if (req.url === '/write' && req.method === 'POST') {
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    try {
+      const { path: filePath, content } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const p = resolveSafe(filePath);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, content, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, path: p }));
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  });
+  return;
+}
+if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 
   if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });

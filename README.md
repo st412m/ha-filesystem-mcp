@@ -8,11 +8,13 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 
 ## Features
 
-- Exposes a local directory (e.g. `/media/VAULT`) via MCP over HTTP
+- Exposes a local directory (e.g. `/media/VAULT`) via MCP over HTTP (StreamableHTTP transport)
 - Token-based auth via URL prefix (`/private_<token>/`)
 - Compatible with [claude.ai](https://claude.ai) custom connectors
 - Configurable vault path
 - Auto-creates vault structure and `CLAUDE.md` on first run
+- PDF reading support — returns pages as JPEG images via `read_media_file` with `#N` suffix
+- `POST /write` endpoint for direct file overwrite from HA automations
 
 ## Community
 
@@ -126,6 +128,48 @@ https://vault-mcp.yourdomain.keenetic.link/private_<your-token>/mcp
 
 Add this URL in **claude.ai → Settings → Connectors → Add custom connector**.
 
+## POST /write endpoint
+
+In addition to the MCP protocol, the addon exposes a simple HTTP endpoint for overwriting files directly from HA automations — useful for generating periodic snapshots without needing a full MCP client.
+
+```
+POST http://<ha-ip>:3100/private_<token>/write
+Content-Type: application/json
+
+{"path": "/media/VAULT/raw/ha/snapshot.md", "content": "# My snapshot\n..."}
+```
+
+To use from a Home Assistant automation, add a `rest_command` to `configuration.yaml`:
+
+```yaml
+rest_command:
+  vault_write:
+    url: !secret vault_write_url
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    payload: '{"path":{{ path | tojson }},"content":{{ content | tojson }}}'
+```
+
+And in `secrets.yaml`:
+
+```yaml
+# vault_write_url keeps your token out of configuration.yaml and automations.
+# Replace with your HA server's local IP, port 3100, and your addon token.
+vault_write_url: "http://192.168.1.10:3100/private_<your-token>/write"
+```
+
+Then call it from an automation action:
+
+```yaml
+- variables:
+    my_content: "# Snapshot\nDate: {{ now() }}"
+- action: rest_command.vault_write
+  data:
+    path: "/media/VAULT/raw/ha/snapshot.md"
+    content: "{{ my_content }}"
+```
+
 ## Recommended companion addons
 
 For the full Karpathy LLM wiki experience, also install:
@@ -147,11 +191,7 @@ Claude (claude.ai)
     ↓ HTTPS
 Reverse proxy (Keenetic / nginx)
     ↓ HTTP :3100
-proxy.js (token auth middleware)
-    ↓ HTTP :3099
-supergateway (MCP-over-HTTP bridge)
-    ↓ stdio
-@modelcontextprotocol/server-filesystem
+server.js (token auth + MCP StreamableHTTP + /write endpoint)
     ↓
 /media/VAULT/ (your files)
 ```
