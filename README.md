@@ -201,6 +201,3 @@ server.js (token auth + MCP StreamableHTTP + /write endpoint)
 ## License
 
 MIT
-
-
-MIT
