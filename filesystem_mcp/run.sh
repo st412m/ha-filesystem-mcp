@@ -7,7 +7,6 @@ export VAULT_PATH="${VAULT_PATH}"
 
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
-# Создаём базовую структуру если её нет
 bashio::log.info "Initializing vault structure..."
 mkdir -p "${VAULT_PATH}/raw/ha"
 mkdir -p "${VAULT_PATH}/raw/projects"
@@ -16,7 +15,6 @@ mkdir -p "${VAULT_PATH}/wiki/ha/automations"
 mkdir -p "${VAULT_PATH}/wiki/ha/network"
 mkdir -p "${VAULT_PATH}/wiki/projects"
 
-# Создаём CLAUDE.md если его нет
 if [ ! -f "${VAULT_PATH}/CLAUDE.md" ]; then
   bashio::log.info "Creating CLAUDE.md..."
   cat > "${VAULT_PATH}/CLAUDE.md" << 'CLAUDEMD'
@@ -58,47 +56,6 @@ VAULT/
 /lint   — Find: broken links, stale data, contradictions, orphan pages
 /update — Update a specific file with new data, preserve change history
 
-## Device page template
-
-# [Device name]
-> [One line — what it is and where it is located]
-
-### Parameters
-- **Entity ID:**
-- **Protocol:** Zigbee / Tuya / BLE / Wi-Fi
-- **MAC/IP:**
-- **Model:**
-- **Integration:**
-
-### Notes
-[Known issues, quirks]
-
-### Related automations
-- [[automation name]]
-
-### Changelog
-- [date] — created
-
-## Automation page template
-
-# [Automation name]
-> [One line — what it does]
-
-### Parameters
-- **ID:** automation.xxx
-- **Mode:** single / restart / queued / parallel
-
-### Logic
-**Trigger:**
-**Condition:**
-**Action:**
-
-### Related devices
-- [[device]]
-
-### Changelog
-- [date] — created
-
 ## MCP servers available to agent
 - **HA-MCP** — Home Assistant entities, automations, addons
 - **Keenetic-MCP** — router: clients, DHCP, Wi-Fi, VPN
@@ -106,7 +63,6 @@ VAULT/
 CLAUDEMD
 fi
 
-# Создаём log.md если его нет
 if [ ! -f "${VAULT_PATH}/log.md" ]; then
   bashio::log.info "Creating log.md..."
   echo "# Vault operation log" > "${VAULT_PATH}/log.md"
@@ -114,11 +70,8 @@ if [ ! -f "${VAULT_PATH}/log.md" ]; then
   echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
 fi
 
-bashio::log.info "Starting supergateway on port 3099"
-supergateway \
-  --port 3099 \
-  --outputTransport streamableHttp \
-  --stdio "npx @modelcontextprotocol/server-filesystem ${VAULT_PATH}" &
+bashio::log.info "Starting Vault MCP Server v2.0 on port 3099"
+node /server.js "${VAULT_PATH}" 3099 &
 
 sleep 2
 

@@ -7,7 +7,7 @@ const PREFIX = `/private_${TOKEN}`;
 
 const server = http.createServer((req, res) => {
   if (!req.url.startsWith(PREFIX)) {
-    res.writeHead(401, {'Content-Type': 'text/plain'});
+    res.writeHead(401, { 'Content-Type': 'text/plain' });
     res.end('Unauthorized\n');
     return;
   }
@@ -29,10 +29,7 @@ const server = http.createServer((req, res) => {
   });
 
   req.pipe(proxy, { end: true });
-  proxy.on('error', () => {
-    res.writeHead(502);
-    res.end('Bad Gateway\n');
-  });
+  proxy.on('error', () => { res.writeHead(502); res.end('Bad Gateway\n'); });
 });
 
 server.listen(LISTEN_PORT, () => {
