@@ -2,7 +2,7 @@
 /**
  * Vault MCP Server — StreamableHTTP транспорт
  * Полная замена supergateway + @modelcontextprotocol/server-filesystem
- * Добавляет: read_pdf_page с поддержкой векторных PDF через SVG
+ * Добавляет: read_pdf_page через синтаксис #N в пути, вывод JPEG
  */
 
 const http = require('http');
