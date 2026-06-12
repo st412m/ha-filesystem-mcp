@@ -345,7 +345,7 @@ async function handleMcpRequest(body) {
     return { jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'vault-mcp-server', version: '2.0.0' }
+      serverInfo: { name: 'vault-mcp-server', version: '2.2.1' }
     }};
   }
 
@@ -438,5 +438,5 @@ if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault MCP Server v2.0 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
+  process.stderr.write(`Vault MCP Server v2.2.1 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
 });
