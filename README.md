@@ -8,11 +8,12 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 
 ## Features
 
-- Exposes a local directory (e.g. `/media/VAULT`) via MCP over HTTP (StreamableHTTP transport)
+- Exposes a local directory (e.g. `/media/VAULT` or `/share/vault`) via MCP over HTTP (StreamableHTTP transport)
+- Multi-arch: amd64, aarch64 (Raspberry Pi 4/5), armv7
 - Token-based auth via URL prefix (`/private_<token>/`)
 - Compatible with [claude.ai](https://claude.ai) custom connectors
-- Configurable vault path
-- Auto-creates vault structure and `CLAUDE.md` on first run
+- Configurable vault path — both `/media` and `/share` are mapped read-write
+- Auto-creates vault structure and `CLAUDE.md` on first run (existing files are never overwritten)
 - PDF reading support — returns pages as JPEG images via `read_media_file` with `#N` suffix
 - `POST /write` endpoint for direct file overwrite from HA automations
 
@@ -22,15 +23,19 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 
 ## Architecture support
 
-> ⚠️ Currently tested and supported on **amd64 only** (x86-64 servers and mini PCs).
-> Raspberry Pi (aarch64/armv7) is not tested yet.
-> If you successfully run this on a different architecture, please open an issue or PR — contributions welcome!
+| Architecture | Status |
+|--------------|--------|
+| amd64 | ✅ Tested (x86-64 servers and mini PCs) |
+| aarch64 | ✅ Tested (Raspberry Pi 4, HA OS 2026.5.x — community-confirmed in [#1](https://github.com/st412m/ha-filesystem-mcp/issues/1)) |
+| armv7 | 🟡 Builds, not field-tested — reports welcome |
 
-## Prerequisites: Setting up a USB drive
+## Where to put your vault
 
-This addon is designed to work with an external USB drive mounted at `/media/VAULT`. Here's how to set it up:
+Two options, pick the one that fits your hardware:
 
-### 1. Format the drive as ext4
+### Option A: External USB drive at `/media/VAULT` (recommended for dedicated storage)
+
+#### 1. Format the drive as ext4
 
 Connect your USB drive to the HA server. Open the Terminal addon in HA and find the drive:
 
@@ -46,7 +51,7 @@ Your drive will appear as `sdb`, `sdc`, or similar — the name depends on your 
 mkfs.ext4 -L VAULT /dev/sdb
 ```
 
-### 2. Install Samba NAS addon for auto-mounting
+#### 2. Install Samba NAS addon for auto-mounting
 
 The [Samba NAS addon](https://github.com/dianlight/hassio-addons) handles automatic mounting of the drive at every HA startup.
 
@@ -58,6 +63,16 @@ The [Samba NAS addon](https://github.com/dianlight/hassio-addons) handles automa
 
 After the addon starts, your drive will be available at `/media/VAULT/` and will remount automatically on every reboot. You can verify in **Settings → System → Storage**.
 
+### Option B: Built-in `/share` storage (no USB drive needed)
+
+If the USB route is more friction than it's worth on your hardware (common on Raspberry Pi), you can keep the vault on HA's internal `/share` storage instead — no formatting, no extra addons:
+
+```yaml
+vault_path: "/share/vault"
+```
+
+The addon maps both `/media` and `/share` read-write, so any path under either works. Keep in mind that `/share` lives on the same disk/SD card as HA itself — for an SD-card Pi setup, consider regular backups of the vault.
+
 ## Installation
 
 1. In Home Assistant go to **Settings → Add-ons → Add-on store**
@@ -67,21 +82,12 @@ After the addon starts, your drive will be available at `/media/VAULT/` and will
    ```
 3. Find **Filesystem MCP Server** and click **Install**
 
-## Beta testing (multi-arch)
-
-> 🧪 If you're on Raspberry Pi or other ARM device, try the beta branch which adds aarch64/armv7 support via `BUILD_FROM`.
-
-Add the beta repository instead of the stable one:
-https://github.com/st412m/ha-filesystem-mcp#beta
-
-Please open an [issue](https://github.com/st412m/ha-filesystem-mcp/issues) with your results — architecture, HA version, and whether it worked.
-
 ## Configuration
 
 | Option | Description |
 |--------|-------------|
 | `token` | Secret token for auth. Generate with `cat /proc/sys/kernel/random/uuid` in HA terminal. Change from the default `changeme`! |
-| `vault_path` | Path to expose via MCP (default: `/media/VAULT`) |
+| `vault_path` | Path to expose via MCP — anywhere under `/media` or `/share` (default: `/media/VAULT`) |
 
 Example:
 ```yaml
@@ -107,6 +113,8 @@ The addon automatically creates the following structure inside your vault if it 
     │   └── network/
     └── projects/
 ```
+
+Initialization is guarded by existence checks: if `CLAUDE.md` or `log.md` already exist at `vault_path`, they are left untouched on every restart — pointing the addon at a pre-populated directory is safe.
 
 You can drop files into `raw/` via the Samba share (`\\<your-ha-ip>\VAULT`) from Windows, or via SFTP.
 
@@ -197,6 +205,12 @@ server.js (token auth + MCP StreamableHTTP + /write endpoint)
     ↓
 /media/VAULT/ (your files)
 ```
+
+## Changelog
+
+- **2.2.1** — multi-arch support (amd64/aarch64/armv7) via `build.yaml`; `share:rw` mapping so `vault_path` can live under `/share`; fixes build failure on Supervisor 2026.04+ ([#1](https://github.com/st412m/ha-filesystem-mcp/issues/1))
+- **2.1.0** — `POST /write` endpoint for HA automations
+- **2.0.0** — custom HTTP MCP server (StreamableHTTP), supergateway removed; PDF page reading
 
 ## License
 
