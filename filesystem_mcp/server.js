@@ -20,6 +20,18 @@ function resolveSafe(p) {
   return resolved;
 }
 
+// Fix for issue #2: some MCP clients (claude.ai / Claude Desktop) serialize
+// array parameters as JSON strings instead of native arrays.
+// Defensively parse them back before use.
+function coerceArray(v, name) {
+  if (typeof v === 'string') {
+    try { v = JSON.parse(v); }
+    catch { throw new Error(`${name} is a JSON string but failed to parse`); }
+  }
+  if (!Array.isArray(v)) throw new Error(`${name} must be an array`);
+  return v;
+}
+
 async function pdfPageCount(p) {
   return new Promise(resolve => {
     execFile('pdfinfo', [p], (err, stdout) => {
@@ -260,8 +272,9 @@ async function callTool(name, args) {
     }
 
     case 'read_multiple_files': {
+      const paths = coerceArray(args.paths, 'paths');
       const results = [];
-      for (const fp of args.paths) {
+      for (const fp of paths) {
         try { results.push(`=== ${fp} ===\n${fs.readFileSync(resolveSafe(fp), 'utf8')}`); }
         catch (e) { results.push(`=== ${fp} ===\nERROR: ${e.message}`); }
       }
@@ -277,13 +290,17 @@ async function callTool(name, args) {
 
     case 'edit_file': {
       const p = resolveSafe(args.path);
+      const edits = coerceArray(args.edits, 'edits');
+      const dry = args.dryRun === true || args.dryRun === 'true';
       let text = fs.readFileSync(p, 'utf8');
-      for (const edit of args.edits) {
+      for (const edit of edits) {
+        if (!edit || typeof edit.oldText !== 'string' || typeof edit.newText !== 'string')
+          throw new Error('each edit must be an object with string oldText and newText');
         if (!text.includes(edit.oldText)) throw new Error(`oldText not found: "${edit.oldText.slice(0, 60)}"`);
         text = text.replace(edit.oldText, edit.newText);
       }
-      if (!args.dryRun) fs.writeFileSync(p, text, 'utf8');
-      return [{ type: 'text', text: `${args.dryRun ? '[DRY RUN] ' : ''}${args.edits.length} edit(s) applied to ${p}` }];
+      if (!dry) fs.writeFileSync(p, text, 'utf8');
+      return [{ type: 'text', text: `${dry ? '[DRY RUN] ' : ''}${edits.length} edit(s) applied to ${p}` }];
     }
 
     case 'create_directory': {
@@ -310,7 +327,7 @@ async function callTool(name, args) {
 
     case 'search_files': {
       const base = resolveSafe(args.path);
-      const exclude = args.excludePatterns || [];
+      const exclude = coerceArray(args.excludePatterns || [], 'excludePatterns');
       const results = [];
       function walk(dir) {
         for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -345,7 +362,7 @@ async function handleMcpRequest(body) {
     return { jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'vault-mcp-server', version: '2.2.1' }
+      serverInfo: { name: 'vault-mcp-server', version: '2.2.2' }
     }};
   }
 
@@ -438,5 +455,5 @@ if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault MCP Server v2.2.1 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
+  process.stderr.write(`Vault MCP Server v2.2.2 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
 });
