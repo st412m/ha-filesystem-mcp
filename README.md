@@ -14,7 +14,7 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 - Compatible with [claude.ai](https://claude.ai) custom connectors
 - Configurable vault path — both `/media` and `/share` are mapped read-write
 - Auto-creates vault structure and `CLAUDE.md` on first run (existing files are never overwritten)
-- PDF reading support — returns pages as JPEG images via `read_media_file` with `#N` suffix
+- PDF reading support — page images (JPEG) via `read_media_file` (`#N` suffix) and `read_pdf_page`, cheap text extraction via `read_pdf_text` (pdftotext)
 - `POST /write` endpoint for direct file overwrite from HA automations
 
 ## Community
@@ -208,6 +208,8 @@ server.js (token auth + MCP StreamableHTTP + /write endpoint)
 
 ## Changelog
 
+- **2.3.0** — new `read_pdf_text` tool (pdftotext with layout preservation, optional page range); removed non-spec `structuredContent` duplication from all tool responses — roughly halves the payload for media results ([#3](https://github.com/st412m/ha-filesystem-mcp/issues/3)); `read_media_file` now actually returns the total PDF page count as documented; removed dead SVG rendering path (`read_pdf_page` always returned JPEG since 2.0.0)
+- **2.2.2** — fix `TypeError` when MCP clients (claude.ai) serialize array parameters as JSON strings — affected `edit_file`, `read_multiple_files`, `search_files` ([#2](https://github.com/st412m/ha-filesystem-mcp/issues/2))
 - **2.2.1** — multi-arch support (amd64/aarch64/armv7) via `build.yaml`; `share:rw` mapping so `vault_path` can live under `/share`; fixes build failure on Supervisor 2026.04+ ([#1](https://github.com/st412m/ha-filesystem-mcp/issues/1))
 - **2.1.0** — `POST /write` endpoint for HA automations
 - **2.0.0** — custom HTTP MCP server (StreamableHTTP), supergateway removed; PDF page reading

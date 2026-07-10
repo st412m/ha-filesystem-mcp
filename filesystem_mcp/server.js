@@ -2,7 +2,7 @@
 /**
  * Vault MCP Server — StreamableHTTP транспорт
  * Полная замена supergateway + @modelcontextprotocol/server-filesystem
- * Добавляет: read_pdf_page с поддержкой векторных PDF через SVG
+ * Добавляет: read_pdf_page (JPEG) и read_pdf_text (pdftotext)
  */
 
 const http = require('http');
@@ -41,16 +41,6 @@ async function pdfPageCount(p) {
   });
 }
 
-async function isVectorPdf(p) {
-  return new Promise(resolve => {
-    execFile('pdfimages', ['-list', p], (err, stdout) => {
-      const lines = (stdout || '').trim().split('\n')
-        .filter(l => l && !l.startsWith('page') && !l.startsWith('-') && l.trim());
-      resolve(lines.length === 0);
-    });
-  });
-}
-
 async function pdfPageToImage(p, n) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-'));
   try {
@@ -67,24 +57,12 @@ async function pdfPageToImage(p, n) {
   }
 }
 
-async function pdfPageToSvg(p, n) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-'));
-  try {
-    await new Promise((res, rej) => execFile('pdftocairo', [
-      '-svg', '-f', String(n), '-l', String(n),
-      p, path.join(tmp, 'page')
-    ], e => e ? rej(e) : res()));
-    const files = fs.readdirSync(tmp).filter(f => f.startsWith('page')).sort();
-    if (!files.length) throw new Error('pdftocairo: no output');
-    const raw = fs.readFileSync(path.join(tmp, files[0]), 'utf8'); const compressed = raw.replace(/\s+/g, ' ').replace(/> </g, '><').trim(); return { type: 'text', text: compressed };
-  } finally {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
-  }
-}
-
-async function renderPdfPage(p, n) {
-  const vector = false;
-  return vector ? pdfPageToSvg(p, n) : pdfPageToImage(p, n);
+async function pdfToText(p, first, last) {
+  return new Promise((res, rej) => {
+    execFile('pdftotext', [
+      '-layout', '-f', String(first), '-l', String(last), p, '-'
+    ], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => err ? rej(err) : res(stdout));
+  });
 }
 
 function mimeType(ext) {
@@ -145,12 +123,12 @@ const TOOLS = [
   },
   {
     name: 'read_media_file',
-    description: 'Read an image, audio, or PDF file. For PDFs returns page 1 as image/SVG and total page count.',
+    description: 'Read an image, audio, or PDF file. For PDFs returns the requested page (default 1, select with #N path suffix) as a JPEG image plus total page count.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'read_pdf_page',
-    description: 'Read a specific page of a PDF file. Vector PDFs return SVG text, raster PDFs return JPEG image. Use after read_media_file tells you the total page count.',
+    description: 'Read a specific page of a PDF file as a JPEG image. Use read_media_file first to learn the total page count, and read_pdf_text to extract text instead of images.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -158,6 +136,19 @@ const TOOLS = [
         page: { type: 'number', description: 'Page number, 1-based' }
       },
       required: ['path', 'page']
+    }
+  },
+  {
+    name: 'read_pdf_text',
+    description: 'Extract text from a PDF file using pdftotext (layout preserved). Reads the whole document or an optional page range. Much cheaper than page images — prefer it for text-heavy PDFs; fall back to read_pdf_page for scanned documents or when layout/graphics matter.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the PDF file' },
+        first_page: { type: 'number', description: 'First page to extract, 1-based (default: 1)' },
+        last_page: { type: 'number', description: 'Last page to extract, 1-based (default: last page of the document)' }
+      },
+      required: ['path']
     }
   },
   {
@@ -252,8 +243,8 @@ async function callTool(name, args) {
       const p = resolveSafe(cleanPath);
       const ext = path.extname(p).toLowerCase();
       if (ext === '.pdf') {
-        const [totalPages, block] = await Promise.all([pdfPageCount(p), renderPdfPage(p, pageNum)]);
-        return [block];
+        const [totalPages, block] = await Promise.all([pdfPageCount(p), pdfPageToImage(p, pageNum)]);
+        return [{ type: 'text', text: `Page ${pageNum} of ${totalPages}` }, block];
       }
       const data = fs.readFileSync(p).toString('base64');
       const mime = mimeType(ext);
@@ -267,8 +258,21 @@ async function callTool(name, args) {
       const n = parseInt(args.page) || 1;
       const total = await pdfPageCount(p);
       if (n < 1 || n > total) throw new Error(`Page ${n} out of range (1-${total})`);
-      const block = await renderPdfPage(p, n);
+      const block = await pdfPageToImage(p, n);
       return [{ type: 'text', text: `Page ${n} of ${total}` }, block];
+    }
+
+    case 'read_pdf_text': {
+      const p = resolveSafe(args.path);
+      if (path.extname(p).toLowerCase() !== '.pdf') throw new Error(`Not a PDF file: ${p}`);
+      const total = await pdfPageCount(p);
+      const first = args.first_page !== undefined ? parseInt(args.first_page) || 1 : 1;
+      const last = args.last_page !== undefined ? parseInt(args.last_page) || total : total;
+      if (first < 1 || last > total || first > last) throw new Error(`Page range ${first}-${last} out of range (1-${total})`);
+      const text = (await pdfToText(p, first, last)).trim();
+      const header = `Pages ${first}-${last} of ${total}`;
+      if (!text) return [{ type: 'text', text: `${header}\n\n(no extractable text — the PDF is likely scanned; use read_pdf_page to view pages as images)` }];
+      return [{ type: 'text', text: `${header}\n\n${text}` }];
     }
 
     case 'read_multiple_files': {
@@ -362,7 +366,7 @@ async function handleMcpRequest(body) {
     return { jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'vault-mcp-server', version: '2.2.2' }
+      serverInfo: { name: 'vault-mcp-server', version: '2.3.0' }
     }};
   }
 
@@ -376,7 +380,9 @@ async function handleMcpRequest(body) {
   if (method === 'tools/call') {
     try {
       const content = await callTool(params.name, params.arguments || {});
-      return { jsonrpc: '2.0', id, result: { content, structuredContent: { content } } };
+      // Issue #3: no structuredContent — tools declare no outputSchema, and
+      // duplicating content into it doubled the payload for base64 media.
+      return { jsonrpc: '2.0', id, result: { content } };
     } catch (e) {
       return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true } };
     }
@@ -455,5 +461,5 @@ if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault MCP Server v2.2.2 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
+  process.stderr.write(`Vault MCP Server v2.3.0 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
 });
