@@ -366,7 +366,7 @@ async function handleMcpRequest(body) {
     return { jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'vault-mcp-server', version: '2.3.0' }
+      serverInfo: { name: 'vault-mcp-server', version: '2.3.1' }
     }};
   }
 
@@ -418,13 +418,11 @@ const server = http.createServer(async (req, res) => {
 }
 if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 
-  if (req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-    res.write(': ping\n\n');
-    return;
-  }
-
-  if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+  // Issue #4: this server never sends server-initiated notifications, so per
+  // the MCP Streamable HTTP spec we decline the GET SSE channel with 405
+  // instead of holding a dead stream open (which hangs clients waiting on it
+  // and starves buffering proxies like cloudflared of any bytes at all).
+  if (req.method !== 'POST') { res.writeHead(405, { 'Allow': 'POST, OPTIONS' }); res.end(); return; }
 
   const accept = req.headers['accept'] || '';
   if (!accept.includes('application/json') && !accept.includes('text/event-stream')) {
@@ -450,16 +448,16 @@ if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
     const result = Array.isArray(body) ? responses : (responses[0] || null);
     if (result === null) { res.writeHead(202); res.end(); return; }
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-    res.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
-    res.end();
+    // Issue #4: plain JSON instead of a single-event SSE response. The spec
+    // allows either ("the server MUST either return Content-Type:
+    // text/event-stream ... or Content-Type: application/json"), and JSON is
+    // immune to SSE buffering in tunnels (cloudflare/cloudflared#1449) that
+    // may truncate large base64 payloads such as read_pdf_page images.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
   });
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault MCP Server v2.3.0 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
+  process.stderr.write(`Vault MCP Server v2.3.1 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
 });

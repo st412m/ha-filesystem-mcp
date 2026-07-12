@@ -70,7 +70,7 @@ if [ ! -f "${VAULT_PATH}/log.md" ]; then
   echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
 fi
 
-bashio::log.info "Starting Vault MCP Server v2.2.1 on port 3099"
+bashio::log.info "Starting Vault MCP Server v2.3.1 on port 3099"
 node /server.js "${VAULT_PATH}" 3099 &
 
 sleep 2
