@@ -1,6 +1,6 @@
 name: "Filesystem MCP Server"
 description: "MCP server for reading/writing files via Model Context Protocol"
-version: "2.3.1"
+version: "2.3.2"
 slug: filesystem_mcp
 init: false
 arch:
@@ -15,8 +15,10 @@ map:
   - media:rw
   - share:rw
 options:
+  log_requests: false
   token: "changeme"
   vault_path: "/media/VAULT"
 schema:
+  log_requests: bool
   token: str
   vault_path: str

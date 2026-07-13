@@ -4,6 +4,8 @@ TOKEN=$(bashio::config 'token')
 VAULT_PATH=$(bashio::config 'vault_path' 2>/dev/null || echo "/media/VAULT")
 export VAULT_TOKEN="${TOKEN}"
 export VAULT_PATH="${VAULT_PATH}"
+LOG_REQUESTS=$(bashio::config 'log_requests' 2>/dev/null || echo "false")
+export LOG_REQUESTS="${LOG_REQUESTS}"
 
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
@@ -70,10 +72,10 @@ if [ ! -f "${VAULT_PATH}/log.md" ]; then
   echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
 fi
 
-bashio::log.info "Starting Vault MCP Server v2.3.1 on port 3099"
+bashio::log.info "Starting Vault MCP Server v2.3.2 on port 3099"
 node /server.js "${VAULT_PATH}" 3099 &
 
 sleep 2
 
-bashio::log.info "Starting auth proxy on port 3100"
+bashio::log.info "Starting auth proxy on port 3100 (request logging: ${LOG_REQUESTS})"
 node /proxy.js
