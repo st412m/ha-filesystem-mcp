@@ -16,6 +16,7 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 - Auto-creates vault structure and `CLAUDE.md` on first run (existing files are never overwritten)
 - PDF reading support — page images (JPEG) via `read_media_file` (`#N` suffix) and `read_pdf_page`, cheap text extraction via `read_pdf_text` (pdftotext)
 - `POST /write` endpoint for direct file overwrite from HA automations
+- Optional request logging (`log_requests`) for debugging connector issues — see [Request logging](#request-logging-debugging)
 
 ## Community
 
@@ -88,12 +89,26 @@ The addon maps both `/media` and `/share` read-write, so any path under either w
 |--------|-------------|
 | `token` | Secret token for auth. Generate with `cat /proc/sys/kernel/random/uuid` in HA terminal. Change from the default `changeme`! |
 | `vault_path` | Path to expose via MCP — anywhere under `/media` or `/share` (default: `/media/VAULT`) |
+| `log_requests` | Log every incoming request to the addon log (default: `false`). See [Request logging](#request-logging-debugging) |
 
 Example:
 ```yaml
 token: "your-uuid-here"
 vault_path: "/media/VAULT"
+log_requests: false
 ```
+
+## Request logging (debugging)
+
+When diagnosing connector problems — especially "claude.ai shows zero tools but curl works" — the key question is usually *did claude.ai's fetcher even reach my server?* Set `log_requests: true` in the addon configuration and restart the addon; the auth proxy will then log one line per incoming request:
+
+```
+[req] 2026-07-13T10:56:25.478Z 160.79.106.34 POST /private_***/mcp -> 200 172B ua="Claude-User"
+```
+
+Fields: timestamp, client IP (`CF-Connecting-IP`, falling back to `X-Forwarded-For`, then socket address), method, path, response status, response size, User-Agent. The secret token is always masked (`/private_***`), and unauthorized (401) probes are logged too. With the default `false` the proxy logs nothing, exactly as before.
+
+Watch the log during a registration attempt: requests from Anthropic's published egress range (`160.79.104.0/21`) getting answered `200` mean the path works end to end; total silence means the requests never reached you — look upstream (tunnel, edge, or claude.ai itself). See the investigation in [#4](https://github.com/st412m/ha-filesystem-mcp/issues/4) for a worked example.
 
 ## What happens on first run
 
@@ -199,15 +214,19 @@ For the full Karpathy LLM wiki experience, also install:
 ```
 Claude (claude.ai)
     ↓ HTTPS
-Reverse proxy (Keenetic / nginx)
+Reverse proxy (Keenetic / nginx / Cloudflare Tunnel)
     ↓ HTTP :3100
-server.js (token auth + MCP StreamableHTTP + /write endpoint)
+proxy.js (token auth, optional request logging)
+    ↓ HTTP :3099
+server.js (MCP StreamableHTTP + /write endpoint)
     ↓
 /media/VAULT/ (your files)
 ```
 
 ## Changelog
 
+- **2.3.2** — new `log_requests` option: opt-in request logging in the auth proxy (client IP, method, token-masked path, status, response size, User-Agent; 401 probes included) for debugging connector issues ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)); no behavior changes with default settings
+- **2.3.1** — GET `/mcp` now returns `405 Method Not Allowed` per the MCP Streamable HTTP spec instead of holding a dead SSE stream open (hung clients ~30s even on LAN, broke tool registration through buffering proxies like Cloudflare Tunnel); POST `/mcp` responds with plain `application/json` instead of a single-event SSE — immune to tunnel SSE buffering that could truncate large base64 payloads ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4))
 - **2.3.0** — new `read_pdf_text` tool (pdftotext with layout preservation, optional page range); removed non-spec `structuredContent` duplication from all tool responses — roughly halves the payload for media results ([#3](https://github.com/st412m/ha-filesystem-mcp/issues/3)); `read_media_file` now actually returns the total PDF page count as documented; removed dead SVG rendering path (`read_pdf_page` always returned JPEG since 2.0.0)
 - **2.2.2** — fix `TypeError` when MCP clients (claude.ai) serialize array parameters as JSON strings — affected `edit_file`, `read_multiple_files`, `search_files` ([#2](https://github.com/st412m/ha-filesystem-mcp/issues/2))
 - **2.2.1** — multi-arch support (amd64/aarch64/armv7) via `build.yaml`; `share:rw` mapping so `vault_path` can live under `/share`; fixes build failure on Supervisor 2026.04+ ([#1](https://github.com/st412m/ha-filesystem-mcp/issues/1))
