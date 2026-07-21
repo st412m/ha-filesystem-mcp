@@ -9,7 +9,7 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 ## Features
 
 - Exposes a local directory (e.g. `/media/VAULT` or `/share/vault`) via MCP over HTTP (StreamableHTTP transport)
-- Multi-arch: amd64, aarch64 (Raspberry Pi 4/5), armv7
+- Multi-arch: amd64, aarch64 (Raspberry Pi 4/5)
 - Token-based auth via URL prefix (`/private_<token>/`)
 - Compatible with [claude.ai](https://claude.ai) custom connectors
 - Configurable vault path — both `/media` and `/share` are mapped read-write
@@ -28,7 +28,8 @@ Home Assistant addon that exposes a local directory as an MCP (Model Context Pro
 |--------------|--------|
 | amd64 | ✅ Tested (x86-64 servers and mini PCs) |
 | aarch64 | ✅ Tested (Raspberry Pi 4, HA OS 2026.5.x — community-confirmed in [#1](https://github.com/st412m/ha-filesystem-mcp/issues/1)) |
-| armv7 | 🟡 Builds, not field-tested — reports welcome |
+
+`armv7` was dropped in 2.4.1: Home Assistant Supervisor deprecated the architecture and warned on every install.
 
 ## Where to put your vault
 

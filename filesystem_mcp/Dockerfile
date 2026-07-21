@@ -53,6 +53,6 @@ RUN chmod a+x /run.sh /toolchain-check.sh \
 LABEL \
   io.hass.version="${BUILD_VERSION}" \
   io.hass.type="addon" \
-  io.hass.arch="amd64|aarch64|armv7"
+  io.hass.arch="amd64|aarch64"
 
 CMD [ "/run.sh" ]
