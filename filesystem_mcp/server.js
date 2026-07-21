@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const VERSION = process.env.ADDON_VERSION || '0.0.0-dev';
 const ALLOWED_DIR = path.resolve(process.argv[2] || '/media/VAULT');
 const PORT = parseInt(process.argv[3] || '3099');
 
@@ -366,7 +367,7 @@ async function handleMcpRequest(body) {
     return { jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'vault-mcp-server', version: '2.3.2' }
+      serverInfo: { name: 'vault-mcp-server', version: VERSION }
     }};
   }
 
@@ -459,5 +460,5 @@ if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault MCP Server v2.3.2 on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
+  process.stderr.write(`Vault MCP Server v${VERSION} on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
 });

@@ -7,6 +7,14 @@ export VAULT_PATH="${VAULT_PATH}"
 LOG_REQUESTS=$(bashio::config 'log_requests' 2>/dev/null || echo "false")
 export LOG_REQUESTS="${LOG_REQUESTS}"
 
+# Версии внешних утилит в логе с первой секунды + манифест сборки (версии и
+# результат смоука PDF-конвейера). Файл лежит в образе, но шелла в контейнер
+# нет — без этой строки прочитать его снаружи нечем.
+bashio::log.info "Toolchain: $(/toolchain-check.sh runtime)"
+if [ -f /toolchain.txt ]; then
+    bashio::log.info "Build manifest: $(tr '\n' ';' < /toolchain.txt | sed 's/;/; /g')"
+fi
+
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
 bashio::log.info "Initializing vault structure..."
@@ -72,7 +80,7 @@ if [ ! -f "${VAULT_PATH}/log.md" ]; then
   echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
 fi
 
-bashio::log.info "Starting Vault MCP Server v2.3.2 on port 3099"
+bashio::log.info "Starting Vault MCP Server v${ADDON_VERSION} on port 3099"
 node /server.js "${VAULT_PATH}" 3099 &
 
 sleep 2
