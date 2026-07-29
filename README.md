@@ -1,10 +1,10 @@
-# Filesystem MCP Server — Home Assistant Addon
+# Filesystem MCP Server — Home Assistant App (Add-on)
 
-Home Assistant addon that exposes a local directory as an MCP (Model Context Protocol) server. Allows LLM agents like Claude to read and write files directly on your Home Assistant server.
+Home Assistant app that exposes a local directory as an MCP (Model Context Protocol) server. Allows LLM agents like Claude to read and write files directly on your Home Assistant server.
 
 ## What is MCP?
 
-[Model Context Protocol](https://modelcontextprotocol.io) is an open standard that allows AI assistants to connect to external tools and data sources. This addon lets Claude (or any MCP-compatible agent) read and write files in a directory on your HA server — useful for building a personal knowledge base, wiki, or any file-based workflow.
+[Model Context Protocol](https://modelcontextprotocol.io) is an open standard that allows AI assistants to connect to external tools and data sources. This app lets Claude (or any MCP-compatible agent) read and write files in a directory on your HA server — useful for building a personal knowledge base, wiki, or any file-based workflow.
 
 ## Features
 
@@ -39,7 +39,7 @@ Two options, pick the one that fits your hardware:
 
 #### 1. Format the drive as ext4
 
-Connect your USB drive to the HA server. Open the Terminal addon in HA and find the drive:
+Connect your USB drive to the HA server. Open the Terminal app in HA and find the drive:
 
 ```bash
 lsblk
@@ -53,36 +53,43 @@ Your drive will appear as `sdb`, `sdc`, or similar — the name depends on your 
 mkfs.ext4 -L VAULT /dev/sdb
 ```
 
-#### 2. Install Samba NAS addon for auto-mounting
+#### 2. Install the Samba NAS app for auto-mounting
 
-The [Samba NAS addon](https://github.com/dianlight/hassio-addons) handles automatic mounting of the drive at every HA startup.
+The [Samba NAS app](https://github.com/dianlight/hassio-addons) handles automatic mounting of the drive at every HA startup.
 
-1. Add the repository in **Settings → Add-ons → Add-on store → ⋮ → Repositories**:
+1. Add the repository in **Settings → Apps → App Store → ⋮ → Repositories → + Add**:
    ```
    https://github.com/dianlight/hassio-addons
    ```
 2. Install **Samba NAS** and start it
 
-After the addon starts, your drive will be available at `/media/VAULT/` and will remount automatically on every reboot. You can verify in **Settings → System → Storage**.
+After the app starts, your drive will be available at `/media/VAULT/` and will remount automatically on every reboot. You can verify in **Settings → System → Storage**.
 
 ### Option B: Built-in `/share` storage (no USB drive needed)
 
-If the USB route is more friction than it's worth on your hardware (common on Raspberry Pi), you can keep the vault on HA's internal `/share` storage instead — no formatting, no extra addons:
+If the USB route is more friction than it's worth on your hardware (common on Raspberry Pi), you can keep the vault on HA's internal `/share` storage instead — no formatting, no extra apps:
 
 ```yaml
 vault_path: "/share/vault"
 ```
 
-The addon maps both `/media` and `/share` read-write, so any path under either works. Keep in mind that `/share` lives on the same disk/SD card as HA itself — for an SD-card Pi setup, consider regular backups of the vault.
+The app maps both `/media` and `/share` read-write, so any path under either works. Keep in mind that `/share` lives on the same disk/SD card as HA itself — for an SD-card Pi setup, consider regular backups of the vault.
 
 ## Installation
 
-1. In Home Assistant go to **Settings → Add-ons → Add-on store**
-2. Click **⋮ → Repositories** and add:
-   ```
-   https://github.com/st412m/ha-filesystem-mcp
-   ```
-3. Find **Filesystem MCP Server** and click **Install**
+> **A note on wording.** Home Assistant renamed **add-ons** to **apps** in 2026.2 (February 2026) — the UI and the docs changed, nothing else did. `config.yaml`, `repository.yaml`, the store layout and the Supervisor API still say *add-on*, which is why the repository is still named `ha-filesystem-mcp`. The click paths in this README are for 2026.2 and newer; on an older core the same two places are called *Add-ons* and *Add-on Store*.
+
+**1. Add this repository**
+
+[![Open your Home Assistant instance and show the add app repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fst412m%2Fha-filesystem-mcp)
+
+Or by hand: **Settings → Apps → App Store → ⋮ → Repositories → + Add**, paste `https://github.com/st412m/ha-filesystem-mcp`, select **Add**.
+
+*If the badge opens the App Store but no dialog appears, that is [my.home-assistant.io#698](https://github.com/home-assistant/my.home-assistant.io/issues/698), open since April 2026 — use the manual path above.*
+
+**2. Install**
+
+Find the **Filesystem MCP Server** card in the new repository, select **Install**, set a `token` and `vault_path` in Configuration, then **Start**.
 
 ## Configuration
 
@@ -90,7 +97,7 @@ The addon maps both `/media` and `/share` read-write, so any path under either w
 |--------|-------------|
 | `token` | Secret token for auth. Generate with `cat /proc/sys/kernel/random/uuid` in HA terminal. Change from the default `changeme`! |
 | `vault_path` | Path to expose via MCP — anywhere under `/media` or `/share` (default: `/media/VAULT`) |
-| `log_requests` | Log every incoming request to the addon log (default: `false`). See [Request logging](#request-logging-debugging) |
+| `log_requests` | Log every incoming request to the app log (default: `false`). See [Request logging](#request-logging-debugging) |
 
 Example:
 ```yaml
@@ -101,7 +108,7 @@ log_requests: false
 
 ## Request logging (debugging)
 
-When diagnosing connector problems — especially "claude.ai shows zero tools but curl works" — the key question is usually *did claude.ai's fetcher even reach my server?* Set `log_requests: true` in the addon configuration and restart the addon; the auth proxy will then log one line per incoming request:
+When diagnosing connector problems — especially "claude.ai shows zero tools but curl works" — the key question is usually *did claude.ai's fetcher even reach my server?* Set `log_requests: true` in the app configuration and restart the app; the auth proxy will then log one line per incoming request:
 
 ```
 [req] 2026-07-13T10:56:25.478Z 160.79.106.34 POST /private_***/mcp -> 200 172B ua="Claude-User"
@@ -113,7 +120,7 @@ Watch the log during a registration attempt: requests from Anthropic's published
 
 ## What happens on first run
 
-The addon automatically creates the following structure inside your vault if it doesn't exist yet:
+The app automatically creates the following structure inside your vault if it doesn't exist yet:
 
 ```
 /media/VAULT/
@@ -130,7 +137,7 @@ The addon automatically creates the following structure inside your vault if it 
     └── projects/
 ```
 
-Initialization is guarded by existence checks: if `CLAUDE.md` or `log.md` already exist at `vault_path`, they are left untouched on every restart — pointing the addon at a pre-populated directory is safe.
+Initialization is guarded by existence checks: if `CLAUDE.md` or `log.md` already exist at `vault_path`, they are left untouched on every restart — pointing the app at a pre-populated directory is safe.
 
 You can drop files into `raw/` via the Samba share (`\\<your-ha-ip>\VAULT`) from Windows, or via SFTP.
 
@@ -156,7 +163,7 @@ Add this URL in **claude.ai → Settings → Connectors → Add custom connector
 
 ## POST /write endpoint
 
-In addition to the MCP protocol, the addon exposes a simple HTTP endpoint for overwriting files directly from HA automations — useful for generating periodic snapshots without needing a full MCP client.
+In addition to the MCP protocol, the app exposes a simple HTTP endpoint for overwriting files directly from HA automations — useful for generating periodic snapshots without needing a full MCP client.
 
 ```
 POST http://<ha-ip>:3100/private_<token>/write
@@ -181,7 +188,7 @@ And in `secrets.yaml`:
 
 ```yaml
 # vault_write_url keeps your token out of configuration.yaml and automations.
-# Replace with your HA server's local IP, port 3100, and your addon token.
+# Replace with your HA server's local IP, port 3100, and your app token.
 vault_write_url: "http://192.168.1.54:3100/private_<your-token>/write"
 ```
 
@@ -196,7 +203,7 @@ Then call it from an automation action:
     content: "{{ my_content }}"
 ```
 
-## Recommended companion addons
+## Recommended companion apps
 
 For the full Karpathy LLM wiki experience, also install:
 
