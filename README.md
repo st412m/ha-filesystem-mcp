@@ -14,6 +14,8 @@ Home Assistant app that exposes a local directory as an MCP (Model Context Proto
 - Compatible with [claude.ai](https://claude.ai) custom connectors
 - Configurable vault path — both `/media` and `/share` are mapped read-write
 - Auto-creates vault structure and `CLAUDE.md` on first run (existing files are never overwritten)
+- **Content search** — `grep_files` finds text by regex across the tree and returns file, line number and the matching line, clipped around the match
+- **Line-addressed reading and editing** — `read_text_file` takes `offset`/`limit`, `edit_file` takes `startLine`/`endLine`, guarded by a `rev` optimistic lock
 - PDF reading support — page images (JPEG) via `read_media_file` (`#N` suffix) and `read_pdf_page`, cheap text extraction via `read_pdf_text` (pdftotext)
 - `POST /write` endpoint for direct file overwrite from HA automations
 - Optional request logging (`log_requests`) for debugging connector issues — see [Request logging](#request-logging-debugging)
@@ -203,6 +205,60 @@ Then call it from an automation action:
     content: "{{ my_content }}"
 ```
 
+## Finding and editing things without reading whole files
+
+Before 2.5.0 an agent could search file *names* (`search_files`) but not file *contents*, and could read only from an edge of a file (`head`/`tail`). Finding one line in the middle of a large page meant pulling half the page into the context window. 2.5.0 closes that: `grep_files` returns addresses, and those addresses are directly usable by `read_text_file` and `edit_file`.
+
+### The loop
+
+```
+grep_files  path=/media/VAULT/wiki  pattern="whitelist-bypass"  include=*.md
+  → /media/VAULT/wiki/todo.md · rev 5db20d56 · 566 lines
+      363: - [ ] Обход белых списков (БС) — pet-проект …
+
+read_text_file  path=…/todo.md  offset=358  limit=15
+  → …/todo.md · rev 5db20d56 · lines 358-372 of 566
+
+edit_file  path=…/todo.md  rev=5db20d56  edits=[{startLine:363, newText:"- [x] …"}]
+  → lines 566 → 566 · rev 5db20d56 → c31af9e1
+```
+
+Every step carries the same `rev` — an 8-hex digest of the file. `edit_file` refuses a line edit whose `rev` no longer matches and writes nothing, so a stale line number can never quietly land in the wrong place. `rev` also comes back from `get_file_info`, alongside a line count.
+
+### What this costs and what it saves
+
+The tool list is sent to the model on every session, whether or not the tools are called, so new tools are a standing tax. Measured on the real `tools/list` payload:
+
+| | tools | `tools/list` bytes |
+|---|---|---|
+| 2.4.1 | 16 | 4 277 |
+| 2.5.0 | 17 | 5 630 |
+
+That is **+1 353 bytes ≈ +350 tokens per session**, and it is deliberately smaller than the raw cost of the new features: existing descriptions were compressed in the same release to pay for part of it, and line-range reading was added as two parameters on `read_text_file` rather than as a separate `read_lines` tool.
+
+Against that, one real lookup from the author's wiki — locating a single stale entry in a 185 KB / 566-line `todo.md`:
+
+| | approach | tokens pulled into context |
+|---|---|---|
+| 2.4.1 | `read_text_file head=400` (line 363 is past the middle) | ≈ 35 000 |
+| 2.5.0 | `grep_files` → 1 file, 1 line + footer | ≈ 60 |
+
+Break-even is roughly one search per hundred sessions. The defaults are set for economy rather than completeness — `max_results` 50, `context` 0, `max_line_length` 200 — because a tool that dumps everything by default costs the same as reading everything.
+
+### Behaviour worth knowing
+
+- **Long lines are clipped around the match, not from the start.** With multi-KB lines a head-clip would routinely hide the very text that matched. `max_line_length` defaults to 200 characters.
+- **Truncation is always announced.** The answer is capped at 60 KB as well as at `max_results`; when either bites, the reply carries an explicit `⚠ TRUNCATED` line. Silently returning a partial list would be worse than returning nothing.
+- **Skipped by design:** binary files (NUL byte in the first 4 KB), files over 20 MB, symlinks, and `.git` / `node_modules` / `.svn` / `.hg` directories. Counts of skipped files appear in the footer.
+- **`include` / `exclude`** are filename globs matched against the basename, with comma-separated alternatives: `include="*.md,*.yaml"`.
+- **Line edits are applied bottom-up in one atomic pass**, so several edits from a single `grep_files` result stay valid within one call. Overlapping ranges are rejected. `newText: ""` deletes the range; `newText` must not end with a newline unless a blank line is wanted.
+- **CRLF, BOM and a missing final newline are preserved** by line edits.
+- `oldText`/`newText` edits are unchanged and still work without `rev`.
+
+### ⚠️ After updating: start a new chat
+
+MCP clients cache `tools/list` for the lifetime of a conversation. After the addon restarts on 2.5.0, existing chats will keep showing the old 16 tools — `grep_files` appears only in a **new** conversation.
+
 ## Recommended companion apps
 
 For the full Karpathy LLM wiki experience, also install:
@@ -216,6 +272,8 @@ For the full Karpathy LLM wiki experience, also install:
 - Never expose port 3100 to the internet without HTTPS
 - Change the default token `changeme` before exposing externally
 - Use a randomly generated UUID as your token
+- Every path is confined to `vault_path`. Since 2.5.0 this also covers symlinks pointing out of the vault and sibling directories that merely share the name prefix (`/media/VAULT_backup` no longer passes for `/media/VAULT`)
+- `grep_files` runs in a short-lived child process with a 10-second hard kill, so a catastrophically backtracking regex cannot wedge the server
 
 ## Architecture
 
@@ -233,6 +291,7 @@ server.js (MCP StreamableHTTP + /write endpoint)
 
 ## Changelog
 
+- **2.5.0** — content search and line-addressed editing. New `grep_files` (regex, recursive, `include`/`exclude` globs, `context`, `max_results`, `max_line_length` — long lines are clipped *around* the match; binaries, symlinks and `.git`/`node_modules` skipped; output capped at 60 KB with an explicit truncation warning; runs in a forked child with a 10 s hard kill so a catastrophically backtracking regex cannot hang the server). `read_text_file` gains `offset`/`limit` for arbitrary line ranges; `edit_file` gains `{startLine,endLine,newText}` edits protected by a `rev` optimistic lock and applied bottom-up in one atomic pass; `get_file_info` now reports `lines` and `rev` for text files. Path confinement hardened: symlinks escaping the vault are refused, and a sibling directory sharing the name prefix no longer passes the check. Existing tool descriptions were compressed to offset part of the added `tools/list` payload. No option, port or storage-format changes; all existing tool signatures and outputs are unchanged
 - **2.4.1** — dropped `armv7`: Home Assistant Supervisor deprecated the architecture and printed a warning on every install. No functional change on amd64/aarch64 — the whole diff is the `arch` list in `config.yaml`, the `io.hass.arch` label in the Dockerfile, and the architecture table above
 - **2.4.0** — migrate off deprecated `build.yaml`: base image is now set in the Dockerfile as the arch-less multi-arch manifest `ghcr.io/home-assistant/base:3.22` (buildx resolves the platform — no silent wrong-arch fallback); toolchain moves to Alpine 3.22 (nodejs 20→22, poppler 24→25), guarded by a build-time major-version check plus a smoke test of the real PDF pipeline (`pdfinfo`/`pdftoppm`/`pdftotext` on a generated reference PDF); toolchain versions and build manifest are printed to the addon log on start; addon version now flows from `config.yaml` → `BUILD_VERSION` → `ADDON_VERSION` (no more hardcoded versions in `server.js`/`run.sh`); dropped unused `npm` from the image
 - **2.3.2** — new `log_requests` option: opt-in request logging in the auth proxy (client IP, method, token-masked path, status, response size, User-Agent; 401 probes included) for debugging connector issues ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)); no behavior changes with default settings
