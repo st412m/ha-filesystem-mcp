@@ -212,9 +212,9 @@ Before 2.5.0 an agent could search file *names* (`search_files`) but not file *c
 ### The loop
 
 ```
-grep_files  path=/media/VAULT/wiki  pattern="whitelist-bypass"  include=*.md
+grep_files  path=/media/VAULT/wiki  pattern=""blacklist-testing"  include=*.md
   → /media/VAULT/wiki/todo.md · rev 5db20d56 · 566 lines
-      363: - [ ] Обход белых списков (БС) — pet-проект …
+      363: - [ ] Проверка черных списков (ЧС) — pet-проект …
 
 read_text_file  path=…/todo.md  offset=358  limit=15
   → …/todo.md · rev 5db20d56 · lines 358-372 of 566
