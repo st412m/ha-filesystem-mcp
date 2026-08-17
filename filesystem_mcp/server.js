@@ -419,7 +419,7 @@ const TOOLS = [
   },
   {
     name: 'edit_file',
-    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or {startLine,endLine,newText} line replacement (1-based inclusive; newText "" deletes, no trailing newline). Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff.',
+    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or {startLine,endLine,newText} line replacement (1-based inclusive; newText "" deletes, no trailing newline; startLine = lines+1 with no endLine appends at EOF). Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -496,8 +496,14 @@ async function callTool(name, args) {
         const head = `${p} · rev ${revOf(text)} · lines ${start}-${end} of ${lines.length}`;
         return [{ type: 'text', text: `${head}\n${lines.slice(start - 1, end).join('\n')}` }];
       }
-      if (args.head) text = text.split('\n').slice(0, args.head).join('\n');
-      else if (args.tail) text = text.split('\n').slice(-args.tail).join('\n');
+      // head/tail must slice the same line array as everything else. Until
+      // 2.5.1 they cut the raw split('\n'), where a trailing newline leaves a
+      // phantom empty element at the END: harmless for head, but it ate one
+      // slot of every tail=N on a file ending with a newline — that is, on
+      // nearly every file. splitLines() drops the phantom. Output is otherwise
+      // byte-identical to <=2.5.0, except that tail no longer trails a newline.
+      if (args.head) text = splitLines(text).lines.slice(0, args.head).join('\n');
+      else if (args.tail) text = splitLines(text).lines.slice(-args.tail).join('\n');
       return [{ type: 'text', text }];
     }
 
@@ -613,11 +619,26 @@ async function callTool(name, args) {
         const norm = edits.map((e, i) => {
           if (!e || typeof e.newText !== 'string') throw new Error(`edit #${i + 1}: newText must be a string ("" deletes the lines)`);
           const s = toInt(e.startLine, `edit #${i + 1} startLine`);
-          const en = e.endLine === undefined ? s : toInt(e.endLine, `edit #${i + 1} endLine`);
-          if (s < 1 || en < s) throw new Error(`edit #${i + 1}: bad range ${s}-${en} (1-based, endLine >= startLine)`);
-          if (en > before) throw new Error(`edit #${i + 1}: endLine ${en} is past the end of the file (${before} lines)`);
-          return { s, en, newText: e.newText };
+          // startLine = lines+1 with no endLine is an append: the empty range
+          // (lines+1 … lines), i.e. "replace zero lines at EOF". Without it
+          // there was no way to add a line to the end of a file by number at
+          // all, which is the single most common write in an append-only log,
+          // and the fallback — oldText on the tail of the last line — is the
+          // exact class of transcription error line addressing exists to kill.
+          // An explicit endLine is never an append: only the shorthand is.
+          const append = s === before + 1 && e.endLine === undefined;
+          const en = append ? before
+            : (e.endLine === undefined ? s : toInt(e.endLine, `edit #${i + 1} endLine`));
+          if (append && e.newText === '')
+            throw new Error(`edit #${i + 1}: newText "" at the append position (line ${s}) deletes nothing — drop the edit instead`);
+          if (s < 1 || (!append && en < s)) throw new Error(`edit #${i + 1}: bad range ${s}-${en} (1-based, endLine >= startLine)`);
+          if (en > before) throw new Error(`edit #${i + 1}: endLine ${en} is past the end of the file (${before} lines) — to append, pass startLine ${before + 1} with no endLine`);
+          return { s, en, newText: e.newText, append };
         }).sort((a, b) => b.s - a.s);
+        // Two appends collapse onto the same insertion point and the bottom-up
+        // pass would silently reverse them. Refuse instead of guessing.
+        if (norm.filter(e => e.append).length > 1)
+          throw new Error('two append edits in one call — merge them into one newText');
         for (let i = 0; i + 1 < norm.length; i++)
           if (norm[i].s <= norm[i + 1].en)
             throw new Error(`edits overlap: lines ${norm[i + 1].s}-${norm[i + 1].en} and ${norm[i].s}-${norm[i].en}`);
@@ -631,7 +652,8 @@ async function callTool(name, args) {
           const insLines = e.newText === '' ? []
             : e.newText.split('\n').map(l => crlf ? l.replace(/\r$/, '') + '\r' : l);
           if (dry) preview.unshift(
-            `@@ ${e.s}-${e.en}: ${removed.length} → ${insLines.length} line(s)\n` +
+            (e.append ? `@@ append after line ${e.en}: +${insLines.length} line(s)\n`
+                      : `@@ ${e.s}-${e.en}: ${removed.length} → ${insLines.length} line(s)\n`) +
             removed.map(l => '- ' + clip(l, 160)).join('\n') +
             (insLines.length ? '\n' + insLines.map(l => '+ ' + clip(l, 160)).join('\n') : '')
           );

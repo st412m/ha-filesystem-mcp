@@ -212,7 +212,7 @@ Before 2.5.0 an agent could search file *names* (`search_files`) but not file *c
 ### The loop
 
 ```
-grep_files  path=/media/VAULT/wiki  pattern=""blacklist-testing"  include=*.md
+grep_files  path=/media/VAULT/wiki  pattern="blacklist-testing"  include=*.md
   → /media/VAULT/wiki/todo.md · rev 5db20d56 · 566 lines
       363: - [ ] Проверка черных списков (ЧС) — pet-проект …
 
@@ -252,12 +252,14 @@ Break-even is roughly one search per hundred sessions. The defaults are set for 
 - **Skipped by design:** binary files (NUL byte in the first 4 KB), files over 20 MB, symlinks, and `.git` / `node_modules` / `.svn` / `.hg` directories. Counts of skipped files appear in the footer.
 - **`include` / `exclude`** are filename globs matched against the basename, with comma-separated alternatives: `include="*.md,*.yaml"`.
 - **Line edits are applied bottom-up in one atomic pass**, so several edits from a single `grep_files` result stay valid within one call. Overlapping ranges are rejected. `newText: ""` deletes the range; `newText` must not end with a newline unless a blank line is wanted.
+- **To append, pass `startLine` = `lines`+1 with no `endLine`** (since 2.5.1). That addresses the empty range at the end of the file, so the content is inserted rather than replacing anything; `rev` is required exactly as for any other line edit. An explicit `endLine` past the last line is still an error. Appending to an empty file is `startLine: 1`.
+- **`head` / `tail` count the same lines as everything else** (since 2.5.1). Before that, `tail=N` on a file ending with a newline returned N−1 lines.
 - **CRLF, BOM and a missing final newline are preserved** by line edits.
 - `oldText`/`newText` edits are unchanged and still work without `rev`.
 
 ### ⚠️ After updating: start a new chat
 
-MCP clients cache `tools/list` for the lifetime of a conversation. After the addon restarts on 2.5.0, existing chats will keep showing the old 16 tools — `grep_files` appears only in a **new** conversation.
+MCP clients cache `tools/list` for the lifetime of a conversation, so a chat that was already open keeps the tool list it started with. On 2.5.0 that meant `grep_files` appeared only in a **new** conversation; on 2.5.1, where no tools were added, it means an open chat will not know that `edit_file` can append.
 
 ## Recommended companion apps
 
@@ -291,6 +293,7 @@ server.js (MCP StreamableHTTP + /write endpoint)
 
 ## Changelog
 
+- **2.5.1** — two fixes from acceptance testing of 2.5.0, no new tools and no schema changes. **`tail=N` returned N−1 lines** on any file ending with a newline — that is, on almost every file: the `head`/`tail` branch sliced a raw `split('\n')`, in which a trailing newline leaves a phantom empty element at the end. It now slices the same line array as `offset`/`limit` and `get_file_info`, so `tail=N` and a `lines` count of N agree. The bug predates 2.5.0; the `lines` field added in 2.5.0 is simply what made it visible. `head` was never affected and its output is unchanged. **Appending by line number is now possible:** `{startLine: lines+1}` with no `endLine` inserts at the end of the file instead of failing with *endLine is past the end of the file*. It is an empty range at EOF, not a new parameter — an explicit `endLine` past the end is still refused (with a hint), `rev` is still mandatory, `newText: ""` at the append position is an error rather than a silent no-op, and two appends in one call are refused instead of being silently reordered by the bottom-up pass. CRLF, BOM and a missing final newline are preserved as before
 - **2.5.0** — content search and line-addressed editing. New `grep_files` (regex, recursive, `include`/`exclude` globs, `context`, `max_results`, `max_line_length` — long lines are clipped *around* the match; binaries, symlinks and `.git`/`node_modules` skipped; output capped at 60 KB with an explicit truncation warning; runs in a forked child with a 10 s hard kill so a catastrophically backtracking regex cannot hang the server). `read_text_file` gains `offset`/`limit` for arbitrary line ranges; `edit_file` gains `{startLine,endLine,newText}` edits protected by a `rev` optimistic lock and applied bottom-up in one atomic pass; `get_file_info` now reports `lines` and `rev` for text files. Path confinement hardened: symlinks escaping the vault are refused, and a sibling directory sharing the name prefix no longer passes the check. Existing tool descriptions were compressed to offset part of the added `tools/list` payload. No option, port or storage-format changes; all existing tool signatures and outputs are unchanged
 - **2.4.1** — dropped `armv7`: Home Assistant Supervisor deprecated the architecture and printed a warning on every install. No functional change on amd64/aarch64 — the whole diff is the `arch` list in `config.yaml`, the `io.hass.arch` label in the Dockerfile, and the architecture table above
 - **2.4.0** — migrate off deprecated `build.yaml`: base image is now set in the Dockerfile as the arch-less multi-arch manifest `ghcr.io/home-assistant/base:3.22` (buildx resolves the platform — no silent wrong-arch fallback); toolchain moves to Alpine 3.22 (nodejs 20→22, poppler 24→25), guarded by a build-time major-version check plus a smoke test of the real PDF pipeline (`pdfinfo`/`pdftoppm`/`pdftotext` on a generated reference PDF); toolchain versions and build manifest are printed to the addon log on start; addon version now flows from `config.yaml` → `BUILD_VERSION` → `ADDON_VERSION` (no more hardcoded versions in `server.js`/`run.sh`); dropped unused `npm` from the image
