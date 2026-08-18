@@ -419,7 +419,7 @@ const TOOLS = [
   },
   {
     name: 'edit_file',
-    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or {startLine,endLine,newText} line replacement (1-based inclusive; newText "" deletes, no trailing newline; startLine = lines+1 with no endLine appends at EOF). Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff.',
+    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or line edits (1-based). {startLine,endLine,newText} replaces the inclusive range; newText "" deletes, no trailing newline. Omitting endLine INSERTS before startLine instead of replacing, and startLine = lines+1 appends at EOF. Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -619,29 +619,44 @@ async function callTool(name, args) {
         const norm = edits.map((e, i) => {
           if (!e || typeof e.newText !== 'string') throw new Error(`edit #${i + 1}: newText must be a string ("" deletes the lines)`);
           const s = toInt(e.startLine, `edit #${i + 1} startLine`);
-          // startLine = lines+1 with no endLine is an append: the empty range
-          // (lines+1 … lines), i.e. "replace zero lines at EOF". Without it
-          // there was no way to add a line to the end of a file by number at
-          // all, which is the single most common write in an append-only log,
-          // and the fallback — oldText on the tail of the last line — is the
-          // exact class of transcription error line addressing exists to kill.
-          // An explicit endLine is never an append: only the shorthand is.
-          const append = s === before + 1 && e.endLine === undefined;
-          const en = append ? before
-            : (e.endLine === undefined ? s : toInt(e.endLine, `edit #${i + 1} endLine`));
-          if (append && e.newText === '')
-            throw new Error(`edit #${i + 1}: newText "" at the append position (line ${s}) deletes nothing — drop the edit instead`);
-          if (s < 1 || (!append && en < s)) throw new Error(`edit #${i + 1}: bad range ${s}-${en} (1-based, endLine >= startLine)`);
-          if (en > before) throw new Error(`edit #${i + 1}: endLine ${en} is past the end of the file (${before} lines) — to append, pass startLine ${before + 1} with no endLine`);
-          return { s, en, newText: e.newText, append };
+          // One shape, one meaning (2.5.2): omitting endLine INSERTS before
+          // startLine — the empty range startLine … startLine-1 — and
+          // startLine = lines+1 is that same insert landing at EOF, i.e. an
+          // append. Replacing a line requires an explicit endLine.
+          // Until 2.5.2 a missing endLine silently meant "replace line
+          // startLine", so an append aimed one line short quietly ate a line
+          // instead of adding one: the exact silent corruption that line
+          // addressing exists to prevent. Inserting into the middle of a file
+          // was impossible at the same time.
+          const insert = e.endLine === undefined;
+          const en = insert ? s - 1 : toInt(e.endLine, `edit #${i + 1} endLine`);
+          if (s < 1) throw new Error(`edit #${i + 1}: bad startLine ${s} (1-based)`);
+          if (insert) {
+            if (s > before + 1) throw new Error(`edit #${i + 1}: startLine ${s} is past the end of the file (${before} lines) — the last insert position is ${before + 1}`);
+            if (e.newText === '') throw new Error(`edit #${i + 1}: newText "" at an insert position (line ${s}) deletes nothing — drop the edit instead`);
+          } else {
+            if (en < s) throw new Error(`edit #${i + 1}: bad range ${s}-${en} (1-based, endLine >= startLine)`);
+            if (en > before) throw new Error(`edit #${i + 1}: endLine ${en} is past the end of the file (${before} lines) — omit endLine to insert instead of replacing (startLine ${before + 1} appends at EOF)`);
+          }
+          return { s, en, newText: e.newText, insert };
         }).sort((a, b) => b.s - a.s);
-        // Two appends collapse onto the same insertion point and the bottom-up
-        // pass would silently reverse them. Refuse instead of guessing.
-        if (norm.filter(e => e.append).length > 1)
-          throw new Error('two append edits in one call — merge them into one newText');
-        for (let i = 0; i + 1 < norm.length; i++)
-          if (norm[i].s <= norm[i + 1].en)
-            throw new Error(`edits overlap: lines ${norm[i + 1].s}-${norm[i + 1].en} and ${norm[i].s}-${norm[i].en}`);
+        // Every pair is checked explicitly. An insert is an empty range, so the
+        // old "next.end < this.start" sweep would have let two inserts share one
+        // position (the bottom-up pass would silently swap them) and let an
+        // insert land inside a range being replaced (undefined whose text wins).
+        for (let i = 0; i < norm.length; i++)
+          for (let j = i + 1; j < norm.length; j++) {
+            const a = norm[i], b = norm[j];
+            if (a.insert && b.insert) {
+              if (a.s === b.s) throw new Error(`two inserts at the same position (line ${a.s}) in one call — merge them into one newText`);
+            } else if (a.insert !== b.insert) {
+              const ins = a.insert ? a : b, rep = a.insert ? b : a;
+              if (ins.s >= rep.s && ins.s <= rep.en)
+                throw new Error(`insert at line ${ins.s} falls inside the replaced range ${rep.s}-${rep.en} — send it as a separate call`);
+            } else if (a.s <= b.en && b.s <= a.en) {
+              throw new Error(`edits overlap: lines ${b.s}-${b.en} and ${a.s}-${a.en}`);
+            }
+          }
         // Applied bottom-up, so earlier edits never shift later ones.
         const preview = [];
         for (const e of norm) {
@@ -652,8 +667,11 @@ async function callTool(name, args) {
           const insLines = e.newText === '' ? []
             : e.newText.split('\n').map(l => crlf ? l.replace(/\r$/, '') + '\r' : l);
           if (dry) preview.unshift(
-            (e.append ? `@@ append after line ${e.en}: +${insLines.length} line(s)\n`
-                      : `@@ ${e.s}-${e.en}: ${removed.length} → ${insLines.length} line(s)\n`) +
+            (e.insert
+              ? (e.s === before + 1
+                  ? `@@ append after line ${before}: +${insLines.length} line(s)\n`
+                  : `@@ insert before line ${e.s}: +${insLines.length} line(s)\n`)
+              : `@@ ${e.s}-${e.en}: ${removed.length} → ${insLines.length} line(s)\n`) +
             removed.map(l => '- ' + clip(l, 160)).join('\n') +
             (insLines.length ? '\n' + insLines.map(l => '+ ' + clip(l, 160)).join('\n') : '')
           );
