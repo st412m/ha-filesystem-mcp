@@ -79,6 +79,18 @@ different rule, it is usually cleaner to lift that directory up to the top
 level. A marker somebody placed deeper by hand is still listed on the page,
 with a button to remove it.
 
+### Order of checks
+
+A refusal is decided from the hardest constraint to the softest, and the message
+you get names the first one that applies. A zone with no trash refuses
+`trash_file` on the grounds of the missing trash rather than asking for a `rev`
+it would never use. A read-only zone refuses an edit before looking at whether
+the text you asked to replace is even in the file.
+
+The second one matters beyond tidiness. If content were inspected first, the
+error messages would let a caller probe what is inside a zone it is not allowed
+to write to.
+
 ### What a policy does not cover
 
 **Read-only stops this add-on's tools and nothing else.** Anything else that
@@ -95,6 +107,19 @@ does not know, **locks its zone**: no writes, no deletion. Reading keeps
 working. This is on purpose — quietly carrying on under a rule nobody can read
 is worse than a stop you can see. The error names the file. Fix it from the
 Vault policies page, or repair the file over Samba or with the file editor.
+
+The lock reaches the whole subtree, **including directories that have perfectly
+valid markers of their own**. A broken marker at the root of the vault therefore
+locks the entire vault, not just the root: `wiki/`, `tmp/` and everything else
+stop accepting writes even though their own markers parse fine. Nor does a
+broken marker fall back on its parent's rule — it locks instead. Both directions
+are deliberate, and they point the same way: when the chain of rules cannot be
+read end to end, nothing is written.
+
+Plan for one consequence of this. While the root marker is broken the assistant
+cannot write anywhere at all, including whatever log or journal it keeps inside
+the vault, so a session cannot even record that it was blocked. Repairing the
+marker is the first thing to do, not something to come back to.
 
 MCP tools refuse to create, change, move or discard anything named
 `.vault-policy`, `create_directory` included. A *directory* with that name would
@@ -116,6 +141,18 @@ Listing: `list_directory`, `list_directory_with_sizes`, `directory_tree`,
 The three listing tools print the policy in force and where it comes from, every
 time. Silence would be read as "no restrictions", and the truth would arrive as
 a refusal — that is, after a mistake.
+
+### If the tool list looks wrong
+
+MCP clients cache `tools/list`. If yours offers 17 tools instead of 18, or shows
+`write_file` with no `rev` parameter, it is holding schemas from before 2.6.0
+and the policies will look broken from the client side while working perfectly
+on the server. Starting a fresh conversation is not necessarily enough — the
+cache can sit further out than that, and the connector has to be re-registered.
+
+The cheap tell is the `rev` parameter on `write_file`, not the number of tools:
+`rev` arrived with 2.6.0 and nothing else adds it, whereas the tool count has
+moved for unrelated reasons across versions and is easy to misremember.
 
 ## Vault structure on a fresh install
 
