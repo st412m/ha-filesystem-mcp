@@ -37,6 +37,19 @@ const server = http.createServer((req, res) => {
   const upstreamUrl = req.url.slice(PREFIX.length);
   const finalUrl = upstreamUrl.startsWith('/') ? upstreamUrl : '/' + upstreamUrl;
 
+  // 2.6.0: an allow-list instead of blind forwarding. Until now this proxy cut
+  // the token prefix off and passed whatever was left to 3099, so every route
+  // the server ever grows is published on the internet the moment it exists —
+  // that is how POST /write came to be reachable from outside. The MCP endpoint
+  // is the only thing that belongs out here; the policy page is on its own port
+  // behind ingress and must never be reachable through this path.
+  if (finalUrl.split('?')[0] !== '/mcp') {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found\n');
+    logLine(req, 404, 10, '(not allowed)');
+    return;
+  }
+
   const options = {
     hostname: '127.0.0.1',
     port: UPSTREAM_PORT,

@@ -17,15 +17,35 @@ fi
 
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
-bashio::log.info "Initializing vault structure..."
-mkdir -p "${VAULT_PATH}/raw/ha"
-mkdir -p "${VAULT_PATH}/raw/projects"
-mkdir -p "${VAULT_PATH}/wiki/ha/devices"
-mkdir -p "${VAULT_PATH}/wiki/ha/automations"
-mkdir -p "${VAULT_PATH}/wiki/ha/network"
-mkdir -p "${VAULT_PATH}/wiki/projects"
+# ---------------------------------------------------------------------------
+# Разметка каталогов — РОВНО ОДИН РАЗ за жизнь установки (2.6.0).
+#
+# До 2.6.0 шесть `mkdir -p` выполнялись при каждом старте: охрана стояла на
+# файлах (CLAUDE.md, log.md создавались только при отсутствии) и не стояла на
+# каталогах, поэтому удалённый каталог молча воскресал после ближайшего
+# рестарта аддона. Теперь решает флаг в /data — он переживает рестарт
+# контейнера, но не переустановку аддона.
+#
+# Отдельная ветка для тех, кто обновляется: флага ещё нет, но вика уже живёт
+# (есть CLAUDE.md) — каталоги не трогаем вообще, просто ставим флаг. Иначе при
+# первом старте 2.6.0 удалённые каталоги воскресли бы в последний раз.
+# ---------------------------------------------------------------------------
+INIT_FLAG="/data/.vault-structure-initialized"
 
-if [ ! -f "${VAULT_PATH}/CLAUDE.md" ]; then
+if [ -f "${INIT_FLAG}" ]; then
+  bashio::log.info "Vault structure: already initialized, leaving the tree alone"
+elif [ -f "${VAULT_PATH}/CLAUDE.md" ]; then
+  bashio::log.info "Vault structure: existing vault detected (CLAUDE.md present) — not recreating directories"
+  touch "${INIT_FLAG}"
+else
+  bashio::log.info "Initializing vault structure (first run)..."
+  mkdir -p "${VAULT_PATH}/raw/ha"
+  mkdir -p "${VAULT_PATH}/raw/projects"
+  mkdir -p "${VAULT_PATH}/wiki/ha/devices"
+  mkdir -p "${VAULT_PATH}/wiki/ha/automations"
+  mkdir -p "${VAULT_PATH}/wiki/ha/network"
+  mkdir -p "${VAULT_PATH}/wiki/projects"
+
   bashio::log.info "Creating CLAUDE.md..."
   cat > "${VAULT_PATH}/CLAUDE.md" << 'CLAUDEMD'
 # CLAUDE.md — Agent Instructions
@@ -71,19 +91,22 @@ VAULT/
 - **Keenetic-MCP** — router: clients, DHCP, Wi-Fi, VPN
 - **Vault-MCP** — read/write files in this vault
 CLAUDEMD
-fi
 
-if [ ! -f "${VAULT_PATH}/log.md" ]; then
   bashio::log.info "Creating log.md..."
   echo "# Vault operation log" > "${VAULT_PATH}/log.md"
   echo "" >> "${VAULT_PATH}/log.md"
   echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
+
+  touch "${INIT_FLAG}"
 fi
 
 bashio::log.info "Starting Vault MCP Server v${ADDON_VERSION} on port 3099"
 node /server.js "${VAULT_PATH}" 3099 &
 
 sleep 2
+
+bashio::log.info "Starting policy page on port 3101 (ingress only)"
+node /policy-ui.js "${VAULT_PATH}" 3101 &
 
 bashio::log.info "Starting auth proxy on port 3100 (request logging: ${LOG_REQUESTS})"
 node /proxy.js

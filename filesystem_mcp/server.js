@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const P = require('./policy');
 
 // grep_files runs in a forked copy of THIS file (argv: --grep-worker <vault>).
 // Rationale: node has no way to time out a regex. A catastrophically
@@ -62,6 +63,86 @@ function resolveSafe(p) {
 // Short content digest used as an optimistic lock for line-addressed edits.
 function revOf(text) {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 8);
+}
+
+function revOfFile(p) {
+  return revOf(fs.readFileSync(p, 'utf8'));
+}
+
+// ---------------------------------------------------------------------------
+// Policy enforcement (2.6.0)
+// ---------------------------------------------------------------------------
+// Markers are read on every call — there is no cache between calls, so a policy
+// changed on the page takes effect on the next tool call. `memo` is created per
+// call and dies with it.
+
+function policyOfDir(dir, memo) {
+  return P.policyForDir(dir, ALLOWED_DIR, memo);
+}
+
+function assertNotMarker(p, verb) {
+  if (path.basename(p) === P.POLICY_FILE)
+    throw new Error(`${P.POLICY_FILE} cannot be ${verb} through MCP tools — the marker is owned by the add-on's "Vault policies" page (Home Assistant sidebar). A directory or file of that name created here would lock the zone with no way to repair it from this side.`);
+}
+
+// Common gate for anything that changes the tree at `p`. Returns the effective
+// policy of the directory that holds p.
+function guardWrite(p, memo, verb) {
+  assertNotMarker(p, verb);
+  const dir = path.dirname(p);
+  const policy = policyOfDir(dir, memo);
+  if (policy.error) throw new Error(`Refused — ${policy.error}`);
+  if (policy.readonly)
+    throw new Error(`Refused — ${dir} is read-only by policy (${P.describePolicy(policy, dir)}). Nothing was written.`);
+  return policy;
+}
+
+// Second gate: the object already exists, so this is a change to existing
+// content rather than a creation.
+function guardOverwrite(p, policy, rev, what) {
+  if (!fs.existsSync(p)) return false;
+  if (policy.overwrite === 'never')
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p))}): ${p} already exists and existing files may not be ${what}. Nothing was written.`);
+  if (policy.overwrite === 'rev') {
+    let cur;
+    try { cur = revOfFile(p); }
+    catch (e) { throw new Error(`Refused — policy "overwrite: rev", but the current rev of ${p} cannot be read (${e.message}).`); }
+    if (rev === undefined || rev === null || rev === '')
+      throw new Error(`Refused — policy "overwrite: rev": changing an existing file requires its current rev, which is ${cur}. Nothing was written. Repeat the call with rev: "${cur}".`);
+    if (String(rev) !== cur)
+      throw new Error(`rev mismatch: file is now ${cur}, you passed ${rev}. It changed since you read it — NOTHING was written. Re-read (grep_files / read_text_file offset / get_file_info) and redo the edit.`);
+  }
+  return true;
+}
+
+// Moving a file OUT of a strict zone needs the same rev as overwriting it in
+// place. Without this the whole thing is bypassed in three steps: move to a
+// free zone, edit there, move back — the way back counts as a creation.
+function guardTakeOut(p, policy, rev, verb) {
+  if (policy.overwrite === 'never')
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p))}): existing files may not be ${verb} out of this zone.`);
+  if (policy.overwrite === 'rev') {
+    const cur = revOfFile(p);
+    if (rev === undefined || rev === null || rev === '')
+      throw new Error(`Refused — policy "overwrite: rev": taking a file out of this zone requires its current rev, which is ${cur}. Read it first, then repeat with rev: "${cur}".`);
+    if (String(rev) !== cur)
+      throw new Error(`rev mismatch: file is now ${cur}, you passed ${rev}. Nothing was moved.`);
+  }
+}
+
+// A trash directory that no marker claims any more. Left strictly alone, but
+// said out loud so it is not mistaken for a live one.
+function orphanTrashNote(dir, policy) {
+  const live = P.trashDirOf(policy);
+  const names = new Set([P.DEFAULT_TRASH]);
+  if (policy.trash) names.add(policy.trash);
+  const notes = [];
+  for (const n of names) {
+    const cand = path.join(dir, n);
+    if (cand === live) continue;
+    try { if (fs.lstatSync(cand).isDirectory()) notes.push(`⚠ ${cand} looks like a trash directory but no policy in force claims it — left alone.`); } catch {}
+  }
+  return notes;
 }
 
 // Split preserving the information needed to rebuild the file byte-for-byte:
@@ -170,17 +251,24 @@ function listDirWithSizes(p, sortBy = 'name') {
   return lines.join('\n') + `\n\nTotal: ${items.filter(i => !i.isDir).length} files, ${items.filter(i => i.isDir).length} directories\nCombined size: ${(total / 1024).toFixed(2)} KB`;
 }
 
-function dirTree(p, level = 0) {
+// Trash directories are omitted: a discarded page that keeps turning up in a
+// tree (or a grep) gets read and quoted again as if it were live. The count of
+// omissions is printed, so nothing disappears silently.
+function dirTree(p, memo, policy, level, hidden) {
+  level = level || 0;
   if (level > 2) return '';
+  const trash = P.trashDirOf(policy);
   const indent = '  '.repeat(level);
   return fs.readdirSync(p, { withFileTypes: true }).map(e => {
+    const full = path.join(p, e.name);
+    if (e.isDirectory() && trash && full === trash) { hidden.n++; return null; }
     const line = `${indent}${e.isDirectory() ? '[DIR]' : '[FILE]'} ${e.name}`;
     if (e.isDirectory() && level < 2) {
-      const sub = dirTree(path.join(p, e.name), level + 1);
+      const sub = dirTree(full, memo, P.applyMarker(policy, full, memo), level + 1, hidden);
       return line + (sub ? '\n' + sub : '');
     }
     return line;
-  }).join('\n');
+  }).filter(l => l !== null).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +315,9 @@ function grepRun(job) {
   if (st.isFile()) {
     files.push(job.root);
   } else if (st.isDirectory()) {
-    const walk = dir => {
+    const memo = new Map();
+    const walk = (dir, policy) => {
+      const trash = P.trashDirOf(policy);
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
@@ -235,8 +325,9 @@ function grepRun(job) {
         if (e.isSymbolicLink()) continue;               // no loops, no escapes
         if (e.isDirectory()) {
           if (GREP_SKIP_DIRS.has(e.name)) continue;
+          if (trash && full === trash) continue;        // trash is not searchable
           if (excRe && excRe.test(e.name)) continue;
-          walk(full);
+          walk(full, P.applyMarker(policy, full, memo));
         } else if (e.isFile()) {
           if (excRe && excRe.test(e.name)) continue;
           if (incRe && !incRe.test(e.name)) continue;
@@ -244,7 +335,7 @@ function grepRun(job) {
         }
       }
     };
-    walk(job.root);
+    walk(job.root, P.policyForDir(job.root, ALLOWED_DIR, memo));
   } else {
     throw new Error(`not a file or directory: ${job.root}`);
   }
@@ -414,12 +505,12 @@ const TOOLS = [
   },
   {
     name: 'write_file',
-    description: 'Create or overwrite a file with given content.',
-    inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] }
+    description: 'Create or overwrite a file with given content. In a zone with policy overwrite="rev", overwriting an EXISTING file requires its current rev (creating a new one does not); the refusal message carries the rev to use.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the file being overwritten. From grep_files, read_text_file offset, or get_file_info.' } }, required: ['path', 'content'] }
   },
   {
     name: 'edit_file',
-    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or line edits (1-based). {startLine,endLine,newText} replaces the inclusive range; newText "" deletes, no trailing newline. Omitting endLine INSERTS before startLine instead of replacing, and startLine = lines+1 appends at EOF. Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff.',
+    description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or line edits (1-based). {startLine,endLine,newText} replaces the inclusive range; newText "" deletes, no trailing newline. Omitting endLine INSERTS before startLine instead of replacing, and startLine = lines+1 appends at EOF. Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff. In a zone with policy overwrite="rev" every edit needs rev, including {oldText}; in overwrite="never" zones editing is refused outright.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -453,8 +544,13 @@ const TOOLS = [
   },
   {
     name: 'move_file',
-    description: 'Move or rename a file or directory.',
-    inputSchema: { type: 'object', properties: { source: { type: 'string' }, destination: { type: 'string' } }, required: ['source', 'destination'] }
+    description: 'Move or rename a file or directory. Taking a file out of a zone with policy overwrite="rev" requires its current rev, exactly like overwriting it in place; directories are not moved out of a strict zone at all. Use trash_file, not this, to discard something.',
+    inputSchema: { type: 'object', properties: { source: { type: 'string' }, destination: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the source file, required when it leaves a zone with overwrite="rev".' } }, required: ['source', 'destination'] }
+  },
+  {
+    name: 'trash_file',
+    description: 'Discard a file by moving it into the trash of its own zone, keeping its relative path and adding an arrival timestamp to the name. There is no delete: this is the only way to remove something. Fails if the zone has no trash configured. In a zone with overwrite="rev" the current rev is required — you have to read a file before throwing it away.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the file, required in a zone with overwrite="rev".' } }, required: ['path'] }
   },
   {
     name: 'search_files',
@@ -478,6 +574,11 @@ const TOOLS = [
 ];
 
 async function callTool(name, args) {
+  // One memo per tool call: policy markers are read fresh every call, and
+  // within a call the same marker is not read twice. It dies with the call, so
+  // there is no stale cache anywhere.
+  const memo = new Map();
+
   switch (name) {
     case 'read_file':
     case 'read_text_file': {
@@ -580,7 +681,15 @@ async function callTool(name, args) {
       const paths = coerceArray(args.paths, 'paths');
       const results = [];
       for (const fp of paths) {
-        try { results.push(`=== ${fp} ===\n${fs.readFileSync(resolveSafe(fp), 'utf8')}`); }
+        try {
+          const p = resolveSafe(fp);
+          // Bulk reads must not scoop discarded versions back into context.
+          // A single deliberate read_text_file still opens them.
+          const trash = P.trashDirOf(policyOfDir(path.dirname(p), memo));
+          if (trash && P.inside(p, trash))
+            throw new Error('this file is in the trash — bulk reads skip it; open it with read_text_file if you really want it');
+          results.push(`=== ${fp} ===\n${fs.readFileSync(p, 'utf8')}`);
+        }
         catch (e) { results.push(`=== ${fp} ===\nERROR: ${e.message}`); }
       }
       return [{ type: 'text', text: results.join('\n\n') }];
@@ -588,17 +697,23 @@ async function callTool(name, args) {
 
     case 'write_file': {
       const p = resolveSafe(args.path);
+      const policy = guardWrite(p, memo, 'written');
+      const existed = guardOverwrite(p, policy, args.rev, 'overwritten');
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, args.content, 'utf8');
-      return [{ type: 'text', text: `Written: ${p}` }];
+      return [{ type: 'text', text: `${existed ? 'Overwritten' : 'Written'}: ${p} · rev ${revOf(args.content)}` }];
     }
 
     case 'edit_file': {
       const p = resolveSafe(args.path);
       const edits = coerceArray(args.edits, 'edits');
       const dry = args.dryRun === true || args.dryRun === 'true';
+      // The policy is checked for a dry run too: better to learn that the zone
+      // is locked before composing the edit than after.
+      const policy = guardWrite(p, memo, 'edited');
       let text = fs.readFileSync(p, 'utf8');
       const rev0 = revOf(text);
+      guardOverwrite(p, policy, args.rev, 'edited');
 
       const byLine = edits.some(e => e && (e.startLine !== undefined || e.endLine !== undefined));
       const byText = edits.some(e => e && e.oldText !== undefined);
@@ -698,40 +813,133 @@ async function callTool(name, args) {
 
     case 'create_directory': {
       const p = resolveSafe(args.path);
+      // The marker-name check matters most here: a DIRECTORY named
+      // .vault-policy is unreadable as a marker, so the zone fails closed and
+      // cannot be repaired with these tools at all.
+      guardWrite(p, memo, 'created');
       fs.mkdirSync(p, { recursive: true });
       return [{ type: 'text', text: `Created: ${p}` }];
     }
 
-    case 'list_directory':
-      return [{ type: 'text', text: listDir(resolveSafe(args.path)) }];
+    case 'list_directory': {
+      const p = resolveSafe(args.path);
+      const policy = policyOfDir(p, memo);
+      const notes = orphanTrashNote(p, policy);
+      return [{ type: 'text', text: [P.describePolicy(policy, p), ...notes, '', listDir(p)].join('\n') }];
+    }
 
-    case 'list_directory_with_sizes':
-      return [{ type: 'text', text: listDirWithSizes(resolveSafe(args.path), args.sortBy) }];
+    case 'list_directory_with_sizes': {
+      const p = resolveSafe(args.path);
+      const policy = policyOfDir(p, memo);
+      const notes = orphanTrashNote(p, policy);
+      return [{ type: 'text', text: [P.describePolicy(policy, p), ...notes, '', listDirWithSizes(p, args.sortBy)].join('\n') }];
+    }
 
-    case 'directory_tree':
-      return [{ type: 'text', text: dirTree(resolveSafe(args.path)) }];
+    case 'directory_tree': {
+      const p = resolveSafe(args.path);
+      const policy = policyOfDir(p, memo);
+      const hidden = { n: 0 };
+      const body = dirTree(p, memo, policy, 0, hidden);
+      const foot = hidden.n ? `\n\n(${hidden.n} trash director${hidden.n === 1 ? 'y' : 'ies'} omitted — reach one by its explicit path)` : '';
+      return [{ type: 'text', text: `${P.describePolicy(policy, p)}\n\n${body}${foot}` }];
+    }
 
     case 'move_file': {
       const src = resolveSafe(args.source);
       const dst = resolveSafe(args.destination);
+      assertNotMarker(src, 'moved');
+      assertNotMarker(dst, 'created');
+      const st = fs.lstatSync(src);
+
+      const srcDir = path.dirname(src);
+      const srcPolicy = policyOfDir(srcDir, memo);
+      if (srcPolicy.error) throw new Error(`Refused — ${srcPolicy.error}`);
+      if (srcPolicy.readonly)
+        throw new Error(`Refused — ${srcDir} is read-only by policy (${P.describePolicy(srcPolicy, srcDir)}); nothing may leave it.`);
+
+      const dstPolicy = guardWrite(dst, memo, 'written');
+
+      // Discarding goes through trash_file, which stamps the name and keeps the
+      // relative path. A hand-rolled move into the trash would produce a file
+      // that the sweeper can never age out.
+      const dstTrash = P.trashDirOf(dstPolicy);
+      if (dstTrash && P.inside(dst, dstTrash))
+        throw new Error(`Refused — do not move things into the trash by hand; use trash_file, which stamps the arrival time and preserves the relative path.`);
+
+      if (st.isDirectory()) {
+        if (srcPolicy.overwrite !== 'free')
+          throw new Error(`Refused — a directory cannot be taken out of a zone with policy "overwrite: ${srcPolicy.overwrite}": a directory has no content and therefore no rev to check. Move its files individually.`);
+      } else {
+        guardTakeOut(src, srcPolicy, args.rev, 'moved');
+      }
+
+      if (fs.existsSync(dst)) {
+        if (dstPolicy.overwrite !== 'free')
+          throw new Error(`Refused — ${dst} already exists and the destination zone has policy "overwrite: ${dstPolicy.overwrite}". Discard the destination first (trash_file), then move.`);
+        if (st.isDirectory())
+          throw new Error(`Refused — ${dst} already exists; a directory is not moved onto an existing path.`);
+      }
+
       fs.renameSync(src, dst);
       return [{ type: 'text', text: `Moved: ${src} → ${dst}` }];
+    }
+
+    case 'trash_file': {
+      const p = resolveSafe(args.path);
+      assertNotMarker(p, 'discarded');
+      const st = fs.lstatSync(p);
+      if (st.isDirectory())
+        throw new Error(`${p} is a directory. Directories are not discarded as a unit — trash the files inside it one by one, then the empty directory can be moved if its zone allows it.`);
+      if (!st.isFile()) throw new Error(`${p} is not a regular file.`);
+
+      const dir = path.dirname(p);
+      const policy = policyOfDir(dir, memo);
+      if (policy.error) throw new Error(`Refused — ${policy.error}`);
+      if (policy.readonly)
+        throw new Error(`Refused — ${dir} is read-only by policy; a trash in a read-only zone would be meaningless and is ignored. Nothing was moved.`);
+
+      const trashDir = P.trashDirOf(policy);
+      if (!trashDir)
+        throw new Error(`Refused — no trash is configured for this zone (${P.describePolicy(policy, dir)}), so nothing can be discarded here. Turn the trash on for the zone on the add-on's "Vault policies" page.`);
+      if (P.inside(p, trashDir)) throw new Error(`${p} is already in the trash.`);
+
+      guardTakeOut(p, policy, args.rev, 'discarded');
+
+      // Relative to the directory that OWNS the trash, so wiki/system/foo.md
+      // lands at wiki/.vault-trash/system/foo.md and stays identifiable.
+      const rel = path.relative(policy.trashOwner, p);
+      const stamp = P.stampNow();
+      let dest = path.join(trashDir, path.dirname(rel), P.stampName(path.basename(p), stamp));
+      for (let i = 1; fs.existsSync(dest); i++) {
+        dest = path.join(trashDir, path.dirname(rel), P.stampName(path.basename(p), `${stamp}-${i}`));
+        if (i > 50) throw new Error('cannot find a free name in the trash');
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.renameSync(p, dest);
+      return [{ type: 'text', text:
+        `Discarded: ${p}\n→ ${dest}\n` +
+        `Nothing was deleted — the file sits in the trash and is excluded from grep_files, search_files, directory_tree and read_multiple_files.` +
+        (policy.retention_enabled ? ` Auto-purge is ON for this zone: it will be erased ${policy.retention_days} days after the timestamp in the name.` : '') }];
     }
 
     case 'search_files': {
       const base = resolveSafe(args.path);
       const exclude = coerceArray(args.excludePatterns || [], 'excludePatterns');
       const results = [];
-      function walk(dir) {
+      let hiddenTrash = 0;
+      function walk(dir, policy) {
+        const trash = P.trashDirOf(policy);
         for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
           if (exclude.some(ex => e.name.includes(ex))) continue;
           const full = path.join(dir, e.name);
+          if (e.isDirectory() && trash && full === trash) { hiddenTrash++; continue; }
           if (e.name.includes(args.pattern) || full.includes(args.pattern)) results.push(full);
-          if (e.isDirectory()) walk(full);
+          if (e.isDirectory()) walk(full, P.applyMarker(policy, full, memo));
         }
       }
-      walk(base);
-      return [{ type: 'text', text: results.join('\n') || 'No matches' }];
+      walk(base, policyOfDir(base, memo));
+      const foot = hiddenTrash ? `\n\n(${hiddenTrash} trash director${hiddenTrash === 1 ? 'y' : 'ies'} not searched)` : '';
+      return [{ type: 'text', text: (results.join('\n') || 'No matches') + foot }];
     }
 
     case 'get_file_info': {
@@ -800,25 +1008,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  if (req.url === '/write' && req.method === 'POST') {
-  const chunks = [];
-  req.on('data', c => chunks.push(c));
-  req.on('end', () => {
-    try {
-      const { path: filePath, content } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const p = resolveSafe(filePath);
-      fs.mkdirSync(path.dirname(p), { recursive: true });
-      fs.writeFileSync(p, content, 'utf8');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, path: p }));
-    } catch (e) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: e.message }));
-    }
-  });
-  return;
-}
-if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
+  // POST /write was removed in 2.6.0. It wrote any file, with no rev check and
+  // no token of its own, and the blind prefix proxy forwarded it straight from
+  // the internet — one curl and every policy below is moot. Its only consumer
+  // was a weekly snapshot that overwrote itself and kept no history.
+  if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 
   // Issue #4: this server never sends server-initiated notifications, so per
   // the MCP Streamable HTTP spec we decline the GET SSE channel with 405
@@ -875,4 +1069,7 @@ if (GREP_WORKER) {
   server.listen(PORT, () => {
     process.stderr.write(`Vault MCP Server v${VERSION} on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
   });
+  // Trash sweep: off unless a zone opts in. Runs shortly after start and once
+  // a day after that.
+  require('./retention').start(ALLOWED_DIR);
 }
