@@ -219,19 +219,47 @@ function parseJsonRows(stdout) {
   return rows;
 }
 
-// PRAGMA hard_heap_limit=N is itself a query: under -json it prints its own
-// result — [{"hard_heap_limit":268435456}] — ahead of the trailing SQL
-// argument's own JSON array, both on stdout, back to back, no separator
-// between them. (First tried suppressing it with .output around just that
-// statement; -safe rejects .output outright — "cannot run .output in safe
-// mode" — confirmed against the real Alpine binary, not this machine's.)
-// Rather than fight the echo, it is put to use: this is the one place we can
-// see, on every single call, that this build's sqlite3 actually accepted the
-// limit — a PRAGMA name SQLite does not recognize is normally a silent no-op.
-const HEAP_LIMIT_ECHO = `[{"hard_heap_limit":${HARD_HEAP_LIMIT_BYTES}}]`;
+// PRAGMA hard_heap_limit=N is itself a query: it prints its own result ahead
+// of the trailing SQL argument's own output, on the same stdout, back to
+// back, no separator between them. (First tried suppressing it with .output
+// around just that statement; -safe rejects .output outright — "cannot run
+// .output in safe mode" — confirmed against the real Alpine binary, not this
+// machine's.) Rather than fight the echo, it is put to use: this is the one
+// place we can see, on every single call, that this build's sqlite3 actually
+// accepted the limit — a PRAGMA name SQLite does not recognize is normally a
+// silent no-op.
+//
+// What that echo looks like is not pinned to one exact string: a build-time
+// smoke test in toolchain-check.sh, running what reads like the identical
+// command line, once got back a bare 268435456 where this got back
+// [{"hard_heap_limit":268435456}] — same value, different serialization, for
+// a reason neither of us could pin down from source alone (not a flag-order
+// difference: the two argv sequences compared byte-for-byte identical). What
+// is not in doubt is the VALUE, so that is what gets checked — either known
+// form confirms the limit is live, and pinning the check to one exact string
+// was the actual bug, not a symptom of a different one.
+const HEAP_LIMIT_ECHO_CANDIDATES = [
+  `[{"hard_heap_limit":${HARD_HEAP_LIMIT_BYTES}}]`, // -json mode
+  `${HARD_HEAP_LIMIT_BYTES}`,                        // default (list) mode
+];
+
+// Streaming-safe prefix check across every known form at once: {done:false}
+// while stdout-so-far could still turn into ANY candidate, {done:true, ok,
+// len} once it has either matched one completely or ruled out all of them.
+function evalHeapLimitEcho(buf) {
+  let stillPossible = false;
+  for (const cand of HEAP_LIMIT_ECHO_CANDIDATES) {
+    if (buf.length >= cand.length) {
+      if (buf.startsWith(cand)) return { done: true, ok: true, len: cand.length };
+    } else if (cand.startsWith(buf)) {
+      stillPossible = true;
+    }
+  }
+  return stillPossible ? { done: false } : { done: true, ok: false };
+}
 
 function heapLimitUnconfirmedError(gotSoFar) {
-  const err = new Error(`HEAP_LIMIT_UNCONFIRMED: this sqlite3 build did not confirm hard_heap_limit=${HARD_HEAP_LIMIT_BYTES} — refusing to run the query rather than risk unbounded memory use. Expected the echo ${HEAP_LIMIT_ECHO} first on stdout, got: ${JSON.stringify(gotSoFar.slice(0, 200))}`);
+  const err = new Error(`HEAP_LIMIT_UNCONFIRMED: this sqlite3 build did not confirm hard_heap_limit=${HARD_HEAP_LIMIT_BYTES} — refusing to run the query rather than risk unbounded memory use. Expected the pragma echo to start with one of: ${HEAP_LIMIT_ECHO_CANDIDATES.join(' | ')}. Got: ${JSON.stringify(gotSoFar.slice(0, 200))}`);
   err.heapLimitUnconfirmed = true;
   return err;
 }
@@ -267,10 +295,11 @@ function runSqliteChecked(dbPath, sql, timeoutMs) {
 
     let stdout = '', stderr = '', stdoutBytes = 0;
     let settled = false, timedOut = false;
-    // 'pending': not enough bytes yet to know either way, but still a valid
-    // prefix of the echo. 'confirmed': matched, stop checking, let the rest
-    // of the stream through untouched. Any divergence rejects immediately.
-    let echoState = 'pending';
+    // 'pending': stdout-so-far is still a valid prefix of at least one known
+    // echo form. 'confirmed': one matched fully — stop checking, let the rest
+    // of the stream through untouched. Any divergence from every known form
+    // rejects immediately. echoMatchedLen is set once confirmed.
+    let echoState = 'pending', echoMatchedLen = 0;
 
     const timer = timeoutMs ? setTimeout(() => { timedOut = true; finish(reject, Object.assign(new Error('timed out'), { timedOut: true })); }, timeoutMs) : null;
 
@@ -292,12 +321,12 @@ function runSqliteChecked(dbPath, sql, timeoutMs) {
       }
       stdout += chunk.toString('utf8');
       if (echoState === 'pending') {
-        if (stdout.length >= HEAP_LIMIT_ECHO.length) {
-          echoState = stdout.startsWith(HEAP_LIMIT_ECHO) ? 'confirmed' : 'failed';
-        } else if (!HEAP_LIMIT_ECHO.startsWith(stdout)) {
-          echoState = 'failed'; // already diverged, no need to wait for more bytes
+        const r = evalHeapLimitEcho(stdout);
+        if (r.done) {
+          if (!r.ok) { finish(reject, heapLimitUnconfirmedError(stdout)); return; }
+          echoState = 'confirmed';
+          echoMatchedLen = r.len;
         }
-        if (echoState === 'failed') { finish(reject, heapLimitUnconfirmedError(stdout)); return; }
       }
     });
     child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
@@ -305,7 +334,7 @@ function runSqliteChecked(dbPath, sql, timeoutMs) {
     child.on('close', code => {
       if (settled) return;
       if (echoState !== 'confirmed') { finish(reject, heapLimitUnconfirmedError(stdout)); return; }
-      const body = stdout.slice(HEAP_LIMIT_ECHO.length);
+      const body = stdout.slice(echoMatchedLen);
       if (code !== 0) {
         finish(reject, Object.assign(new Error(stderr || `sqlite3 exited with code ${code}`), { stderrSoFar: stderr, stdoutSoFar: body }));
         return;

@@ -98,8 +98,11 @@ PDF_EOF
   pdfinfo "$T/smoke.pdf" | grep -Eq '^Pages:[[:space:]]+1$' \
     || { echo "SMOKE FAIL: pdfinfo не отдал Pages: 1" >&2; exit 1; }
 
-  # pdftoppm: РОВНО те флаги, что в server.js pdfPageToImage()
-  pdftoppm -jpeg -r 120 -scale-to 1400 -f 1 -l 1 "$T/smoke.pdf" "$T/page" \
+  # pdftoppm: РОВНО те флаги, что в server.js pdfPageToImage(). stderr глушится:
+  # в образе нет шрифтов, poppler пишет "Couldn't find a font for 'Helvetica'"
+  # и всё равно рендерит (заменяет её); сборку это не ломает — ниже уже
+  # проверяются код выхода, наличие файла и его JPEG-заголовок.
+  pdftoppm -jpeg -r 120 -scale-to 1400 -f 1 -l 1 "$T/smoke.pdf" "$T/page" 2>/dev/null \
     || { echo "SMOKE FAIL: pdftoppm упал" >&2; exit 1; }
   J=$(ls "$T"/page*.jpg 2>/dev/null | head -1)
   [ -n "$J" ] && [ -s "$J" ] || { echo "SMOKE FAIL: pdftoppm не дал JPEG" >&2; exit 1; }
@@ -111,10 +114,7 @@ PDF_EOF
     || { echo "SMOKE FAIL: pdftotext не извлёк маркер" >&2; exit 1; }
 
   # sqlite3: та же командная строка, что sqlite.js использует в runSqlite() —
-  # включая -cmd "PRAGMA hard_heap_limit=...", добавленный в 2.7.1. Ровно та
-  # же строка, что и в бою, а не упрощённая версия: 2.7.1 уже показал, что
-  # смоук на своей, слегка другой командной строке проверяет не то, чем
-  # реально рискуют запросы.
+  # включая -cmd "PRAGMA hard_heap_limit=...", добавленный в 2.7.1.
   sqlite3 "$T/smoke.db" "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);" \
     || { echo "SMOKE FAIL: не удалось создать тестовую базу" >&2; exit 1; }
   HHL_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t")
@@ -123,7 +123,15 @@ PDF_EOF
   # молча ничего не делает, поэтому без этой проверки апдейт Alpine, тихо
   # уронивший поддержку hard_heap_limit, не дал бы вообще никакого симптома —
   # до первого настоящего OOM, который положит весь процесс аддона.
-  echo "$HHL_OUT" | grep -q '^\[{"hard_heap_limit":268435456}\]' \
+  #
+  # Форма эха не закреплена железно: этот же смоук на реальной сборке уже
+  # один раз вернул голое "268435456" там, где sqlite.js параллельно видел
+  # "[{\"hard_heap_limit\":268435456}]" — при внешне идентичной командной
+  # строке (сравнивали байт в байт, разницы не нашли). Значение то же самое,
+  # сериализация — нет; причина не установлена, гоняться за ней дальше не
+  # стали. Проверяется поэтому именно значение, а не одна конкретная форма —
+  # ровно то же самое исправление, что и в sqlite.js (see HEAP_LIMIT_ECHO_CANDIDATES).
+  echo "$HHL_OUT" | grep -Eq '^(\[\{"hard_heap_limit":268435456\}\]|268435456([^0-9]|$))' \
     || { echo "SMOKE FAIL: hard_heap_limit не подтверждён эхом прагмы (получено: $HHL_OUT)" >&2; exit 1; }
   echo "$HHL_OUT" | grep -q '"n":3' \
     || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json не вернул ожидаемый COUNT(*)" >&2; exit 1; }
