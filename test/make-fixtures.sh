@@ -172,4 +172,53 @@ GOT=$(sqlite3 -readonly -safe -json "$OUT/wal_hotcopy.db" "SELECT COUNT(*) AS n 
 echo "$GOT" | grep -q '"n":3' \
   || { echo "make-fixtures: FATAL — wal_hotcopy.db did not read back 3 rows under -readonly -safe (got: $GOT)" >&2; exit 1; }
 
+# --- self-check: hard_heap_limit actually stops an unbounded recursive CTE -
+# sitting under an aggregate. SELECT * FROM (<sql>) LIMIT n, the wrapper
+# sqlite_query puts around every call, does not bound this shape: max() has to
+# consume the whole (infinite) input before it can produce its one output row,
+# so the outer LIMIT never gets a chance to matter. Without hard_heap_limit
+# this grows in memory until timeout_ms (up to 30s) or the OOM killer takes
+# the whole add-on process with it.
+#
+# This runs sqlite.js itself (not raw sqlite3) because the thing being checked
+# is OUR error-code mapping (QUERY_TOO_LARGE), not just the underlying SQLite
+# behaviour. It asserts the error is actually raised — it does not skip when
+# the limiter is unavailable, and it will fail on anything other than exactly
+# QUERY_TOO_LARGE. timeout_ms below is 3s, not the tool's own 30s ceiling: on
+# a working limiter (Alpine) hard_heap_limit trips almost immediately, so 3s
+# changes nothing about what actually passes — it only bounds how long this
+# check is allowed to run an unbounded-memory query on a box where the
+# limiter does NOT work (this one, confirmed — see HARD_HEAP_LIMIT_BYTES in
+# sqlite.js), where it will exhaust the 3s and correctly report FATAL. That is
+# a true red, not a reason to soften the assertion — the add-on only ever
+# runs on Alpine, which is where this is meant to actually pass.
+CHECK_JS="$OUT/.hard-heap-limit-check.js"
+cat > "$CHECK_JS" <<'JS'
+const path = require('path');
+const S = require(path.join(process.env.SQLITE_MODULE_DIR, 'sqlite.js'));
+const dbPath = path.join(process.env.FIXTURES_DIR, 'empty.db');
+(async () => {
+  try {
+    await S.query(
+      dbPath,
+      'SELECT max(n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)',
+      { timeout_ms: 3000 }
+    );
+    console.error('FATAL: unbounded recursive CTE under an aggregate did not error at all — hard_heap_limit is not stopping it');
+    process.exit(1);
+  } catch (e) {
+    if (!/^QUERY_TOO_LARGE:/.test(e.message)) {
+      console.error('FATAL: expected QUERY_TOO_LARGE, got: ' + e.message);
+      process.exit(1);
+    }
+    console.error('hard_heap_limit check OK: ' + e.message);
+  }
+})();
+JS
+SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" node "$CHECK_JS"
+CHECK_RC=$?
+rm -f "$CHECK_JS"
+[ "$CHECK_RC" -eq 0 ] \
+  || { echo "make-fixtures: FATAL — hard_heap_limit self-check failed (see above)" >&2; exit 1; }
+
 echo "Done: $(ls "$OUT" | wc -l) fixture file(s) in $OUT"

@@ -110,10 +110,22 @@ PDF_EOF
   pdftotext -layout -f 1 -l 1 "$T/smoke.pdf" - | grep -q 'VMCP-SMOKE-OK' \
     || { echo "SMOKE FAIL: pdftotext не извлёк маркер" >&2; exit 1; }
 
-  # sqlite3: та же командная строка, что sqlite.js использует в runSqlite()
+  # sqlite3: та же командная строка, что sqlite.js использует в runSqlite() —
+  # включая -cmd "PRAGMA hard_heap_limit=...", добавленный в 2.7.1. Ровно та
+  # же строка, что и в бою, а не упрощённая версия: 2.7.1 уже показал, что
+  # смоук на своей, слегка другой командной строке проверяет не то, чем
+  # реально рискуют запросы.
   sqlite3 "$T/smoke.db" "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);" \
     || { echo "SMOKE FAIL: не удалось создать тестовую базу" >&2; exit 1; }
-  sqlite3 -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t" | grep -q '"n":3' \
+  HHL_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t")
+  # Эхо прагмы — единственное место, где на каждом вызове видно, что ЭТА
+  # сборка sqlite3 действительно приняла лимит: незнакомое имя PRAGMA обычно
+  # молча ничего не делает, поэтому без этой проверки апдейт Alpine, тихо
+  # уронивший поддержку hard_heap_limit, не дал бы вообще никакого симптома —
+  # до первого настоящего OOM, который положит весь процесс аддона.
+  echo "$HHL_OUT" | grep -q '^\[{"hard_heap_limit":268435456}\]' \
+    || { echo "SMOKE FAIL: hard_heap_limit не подтверждён эхом прагмы (получено: $HHL_OUT)" >&2; exit 1; }
+  echo "$HHL_OUT" | grep -q '"n":3' \
     || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json не вернул ожидаемый COUNT(*)" >&2; exit 1; }
 
   # -safe должна отбивать ATTACH — без этого запрос читает любой файл на

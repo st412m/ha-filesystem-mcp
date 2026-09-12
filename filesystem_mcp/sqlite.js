@@ -21,7 +21,7 @@
  * shell-interpolated), no npm dependency.
  */
 
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -33,6 +33,27 @@ const DEFAULT_LIMIT = 100, MAX_LIMIT = 1000;
 const DEFAULT_TIMEOUT_MS = 5000, MAX_TIMEOUT_MS = 30000;
 const DEFAULT_COUNTS_TIMEOUT_MS = 60000, MAX_COUNTS_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_STDOUT_BYTES = 1024 * 1024; // 1 MiB ceiling on sqlite3's stdout
+
+// A LIMIT wrapped around the outer statement does not bound an unbounded
+// recursive CTE sitting under an aggregate — SELECT max(n) FROM (WITH
+// RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)
+// must fully materialize the (infinite) input before max() can produce a row,
+// so the LIMIT in query()'s wrapper never gets a chance to matter. Without a
+// second, independent stop that failure mode grows in memory until timeout_ms
+// (up to 30s) or the OOM killer takes the whole add-on process with it —
+// every file tool included, not just this query. Confirmed against the real
+// Alpine sqlite3 in the add-on image (3.49.2, by hand, not from this
+// machine): PRAGMA hard_heap_limit sets from the default off (0) and turns
+// that query into "out of memory" instead of unbounded growth. This machine's
+// own sqlite3 (Windows, 3.44.4) is not evidence either way for anything
+// involving -safe's exact restricted-command list or heap enforcement — it
+// has already been wrong once (see runSqlite()'s comment on the pragma's
+// echo) — so nothing here is asserted as verified unless it was actually run
+// against the real Alpine binary.
+// 256 MiB, hardcoded and not exposed as a tool parameter: raising it changes
+// what "unbounded" means for every query and every table's COUNT(*), not just
+// the one call that asked for it.
+const HARD_HEAP_LIMIT_BYTES = 268435456;
 
 const STATEMENT_KEYWORDS = ['SELECT', 'WITH', 'VALUES', 'EXPLAIN'];
 
@@ -97,6 +118,18 @@ function assertRegularFile(p) {
   return st;
 }
 
+// null unless every byte is printable ASCII — a hex dump of genuine binary
+// garbage (an encrypted SQLCipher header, random bytes) gains nothing from an
+// ASCII rendering, so it is only added when it would actually read as text.
+function asciiIfPrintable(buf) {
+  let s = '';
+  for (const b of buf) {
+    if (b < 0x20 || b > 0x7e) return null;
+    s += String.fromCharCode(b);
+  }
+  return s;
+}
+
 // Type is decided by the first 16 bytes only, never the extension — Bluecoins
 // backups do not end in .db, and guessing from a suffix is a guaranteed bug
 // report waiting to happen.
@@ -107,7 +140,10 @@ function checkSqliteHeader(p) {
     const n = fs.readSync(fd, buf, 0, 16, 0);
     const head = buf.subarray(0, n);
     if (n < 16 || head.toString('latin1') !== SQLITE_HEADER) {
-      throw new Error(`NOT_SQLITE: ${p} is not a SQLite database — first ${n} byte(s): ${head.toString('hex')}`);
+      const hex = head.toString('hex');
+      const ascii = asciiIfPrintable(head);
+      const shown = ascii ? `${hex} ("${ascii}")` : hex;
+      throw new Error(`NOT_SQLITE: ${p} is not a SQLite database — first ${n} byte(s): ${shown}`);
     }
   } finally {
     fs.closeSync(fd);
@@ -150,6 +186,13 @@ function mapSpawnError(err, dbPath, timeoutMs) {
   if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(err.message || ''))
     return new Error(`OUTPUT_TOO_LARGE: sqlite3 output exceeded ${MAX_STDOUT_BYTES} bytes — narrow the column list or lower limit. No partial result is returned.`);
   const msg = (err.stderrSoFar || err.message || '').toString().trim();
+  // hard_heap_limit tripped: the query's working memory, not its output, is
+  // the problem — typically an unbounded recursive CTE or a cartesian product
+  // sitting under an aggregate, which LIMIT cannot bound (see the constant's
+  // comment above). Distinct from OUTPUT_TOO_LARGE (a large RESULT) and
+  // QUERY_TIMEOUT (ran too long, however much memory it used).
+  if (/out of memory/i.test(msg))
+    return new Error(`QUERY_TOO_LARGE: the query exceeded its working-memory limit (${HARD_HEAP_LIMIT_BYTES} bytes, fixed) and was stopped — typically an unbounded recursive CTE or a cartesian product under an aggregate, which LIMIT cannot bound because the aggregate must consume all input first. Narrow the query.`);
   // A read-only connection needs to create the -shm wal-index itself when it
   // does not already exist, which needs write access on the DIRECTORY, not
   // the database file (sqlite.org/wal.html). This fails on a read-only
@@ -176,10 +219,112 @@ function parseJsonRows(stdout) {
   return rows;
 }
 
+// PRAGMA hard_heap_limit=N is itself a query: under -json it prints its own
+// result — [{"hard_heap_limit":268435456}] — ahead of the trailing SQL
+// argument's own JSON array, both on stdout, back to back, no separator
+// between them. (First tried suppressing it with .output around just that
+// statement; -safe rejects .output outright — "cannot run .output in safe
+// mode" — confirmed against the real Alpine binary, not this machine's.)
+// Rather than fight the echo, it is put to use: this is the one place we can
+// see, on every single call, that this build's sqlite3 actually accepted the
+// limit — a PRAGMA name SQLite does not recognize is normally a silent no-op.
+const HEAP_LIMIT_ECHO = `[{"hard_heap_limit":${HARD_HEAP_LIMIT_BYTES}}]`;
+
+function heapLimitUnconfirmedError(gotSoFar) {
+  const err = new Error(`HEAP_LIMIT_UNCONFIRMED: this sqlite3 build did not confirm hard_heap_limit=${HARD_HEAP_LIMIT_BYTES} — refusing to run the query rather than risk unbounded memory use. Expected the echo ${HEAP_LIMIT_ECHO} first on stdout, got: ${JSON.stringify(gotSoFar.slice(0, 200))}`);
+  err.heapLimitUnconfirmed = true;
+  return err;
+}
+
+// Checking the echo only after the process exits (as an earlier version of
+// this function did, via spawnSqlite3/execFile) means an unbounded query on a
+// build where the limit silently did not take hold gets to run to completion
+// — or to timeout_ms, or to the OS OOM-killer — before the check ever runs.
+// That is exactly the case this whole mechanism exists to catch: the
+// protection would arrive after the damage, not instead of it. So this reads
+// stdout as it streams in instead of buffering it: the echo is the first
+// thing sqlite3 ever writes, checked against the exact expected bytes as soon
+// as enough of them have arrived (or killed the moment they diverge, without
+// waiting for a full line) — before the trailing SQL argument's query has any
+// real chance to grow. This is why runSqlite() cannot share spawnSqlite3()
+// (execFile only hands back stdout once the process has already exited);
+// sqliteVersion() has no query to protect against and keeps using it.
+function runSqliteChecked(dbPath, sql, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-sqlite-'));
+    const cleanup = () => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} };
+    const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-readonly', '-safe', '-json', dbPath, sql];
+
+    let child;
+    try {
+      child = spawn(SQLITE_BIN, args, { cwd: tmp, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      cleanup();
+      reject(e);
+      return;
+    }
+    try { child.stdin.end(); } catch {}
+
+    let stdout = '', stderr = '', stdoutBytes = 0;
+    let settled = false, timedOut = false;
+    // 'pending': not enough bytes yet to know either way, but still a valid
+    // prefix of the echo. 'confirmed': matched, stop checking, let the rest
+    // of the stream through untouched. Any divergence rejects immediately.
+    let echoState = 'pending';
+
+    const timer = timeoutMs ? setTimeout(() => { timedOut = true; finish(reject, Object.assign(new Error('timed out'), { timedOut: true })); }, timeoutMs) : null;
+
+    function finish(fn, arg) {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { child.kill('SIGKILL'); } catch {}
+      cleanup();
+      fn(arg);
+    }
+
+    child.stdout.on('data', chunk => {
+      if (settled) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_STDOUT_BYTES) {
+        finish(reject, Object.assign(new Error('stdout maxBuffer exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+        return;
+      }
+      stdout += chunk.toString('utf8');
+      if (echoState === 'pending') {
+        if (stdout.length >= HEAP_LIMIT_ECHO.length) {
+          echoState = stdout.startsWith(HEAP_LIMIT_ECHO) ? 'confirmed' : 'failed';
+        } else if (!HEAP_LIMIT_ECHO.startsWith(stdout)) {
+          echoState = 'failed'; // already diverged, no need to wait for more bytes
+        }
+        if (echoState === 'failed') { finish(reject, heapLimitUnconfirmedError(stdout)); return; }
+      }
+    });
+    child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
+    child.on('error', err => finish(reject, err));
+    child.on('close', code => {
+      if (settled) return;
+      if (echoState !== 'confirmed') { finish(reject, heapLimitUnconfirmedError(stdout)); return; }
+      const body = stdout.slice(HEAP_LIMIT_ECHO.length);
+      if (code !== 0) {
+        finish(reject, Object.assign(new Error(stderr || `sqlite3 exited with code ${code}`), { stderrSoFar: stderr, stdoutSoFar: body }));
+        return;
+      }
+      finish(resolve, { stdout: body, stderr });
+    });
+  });
+}
+
 async function runSqlite(dbPath, sql, timeoutMs) {
+  // Every caller goes through here, so sqlite_schema's DDL/PRAGMA queries and
+  // every table's COUNT(*) get the same limit and the same streamed
+  // confirmation that sqlite_query does.
   let res;
-  try { res = await spawnSqlite3(['-readonly', '-safe', '-json', dbPath, sql], { timeoutMs }); }
-  catch (err) { throw mapSpawnError(err, dbPath, timeoutMs); }
+  try { res = await runSqliteChecked(dbPath, sql, timeoutMs); }
+  catch (err) {
+    if (err.heapLimitUnconfirmed) throw err; // already a finished HEAP_LIMIT_UNCONFIRMED Error
+    throw mapSpawnError(err, dbPath, timeoutMs);
+  }
   return parseJsonRows(res.stdout);
 }
 
@@ -203,6 +348,7 @@ async function schema(p, opts) {
   const wantCounts = opts.counts === true || opts.counts === 'true';
   const countsTimeoutMs = clampInt(opts.counts_timeout_ms, DEFAULT_COUNTS_TIMEOUT_MS, 1, MAX_COUNTS_TIMEOUT_MS, 'counts_timeout_ms');
 
+  const t0 = Date.now();
   const st = assertRegularFile(p);
   checkSqliteHeader(p);
 
@@ -241,7 +387,7 @@ async function schema(p, opts) {
   }
   const countsIncomplete = incompleteTables && {
     tables: incompleteTables,
-    note: `did not finish within counts_timeout_ms=${countsTimeoutMs} (a per-table budget that also covers spawning sqlite3 and opening the database file, not just the COUNT(*) itself) — raise counts_timeout_ms, or run SELECT COUNT(*) via sqlite_query with its own timeout_ms for just one of these tables`,
+    note: `COUNT(*) did not finish within counts_timeout_ms=${countsTimeoutMs} — raise it, or count one table via sqlite_query`,
   };
 
   return {
@@ -256,6 +402,7 @@ async function schema(p, opts) {
     shm_present: fs.existsSync(`${p}-shm`),
     counts,
     counts_incomplete: countsIncomplete,
+    elapsed_ms: Date.now() - t0,
   };
 }
 
