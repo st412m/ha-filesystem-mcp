@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.7.1
+
+**A memory ceiling on SQLite queries.** Every `sqlite3` call now runs under a fixed working-memory limit of 256 MiB. A query that tries to allocate more than that is stopped and reported as `QUERY_TOO_LARGE`, which is a different failure from running out of time (`QUERY_TIMEOUT`) or returning too much (`OUTPUT_TOO_LARGE`). The queries this catches are the ones that allocate heavily in one place: a large sort, `group_concat()` over many rows, `hex()` on a large BLOB.
+
+The limit is verified rather than assumed. SQLite's memory limiter is only active in builds that track allocations, and a build where it is compiled out accepts the setting and silently ignores it. So the add-on reads back the value SQLite reports, checks it as it arrives, and refuses to run the query at all if it doesn't match — `HEAP_LIMIT_UNCONFIRMED`. The same check runs at image build time, next to the existing `ATTACH` smoke test, so a future base image that drops the limiter fails the build instead of quietly losing the ceiling.
+
+### Changed
+
+- `sqlite_schema` now reports `elapsed_ms`, as `sqlite_query` already did. With `counts: true` the time taken is the main thing worth knowing.
+- `NOT_SQLITE` prints the first sixteen bytes as ASCII alongside the hex when they are printable. `74686973...` is `this is not a sq`, and nobody reads that off the hex.
+- The note on an incomplete count is down from 236 characters to under 100. It no longer restates what the timeout means — that belongs in the tool description, which a caller reads before calling.
+- The `sqlite_schema` description now says to call it without `counts` first and only then with `counts` if needed. The DDL comes back in full either way, so on a database with many tables the second call repeats what you already have.
+- Text files in the repository are now pinned to LF via `.gitattributes`, so a checkout on Windows with `core.autocrlf=true` no longer rewrites the shell scripts with CRLF endings.
+- The PDF smoke test no longer prints poppler's missing-font warning. The exit code, the output file and its header are still checked, so a real failure is not lost in the quiet.
+
+Nothing about reading, policies, trash, `rev`, the ingress page or the options schema has changed.
+
 ## 2.7.0
 
 **Read-only SQLite.** A `.db` file in the vault can now be inspected and

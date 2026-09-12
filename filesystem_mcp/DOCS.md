@@ -177,6 +177,19 @@ listed once in `counts_incomplete.tables`, with a single shared explanation in
 `sqlite_query`'s `timeout_ms` bounds the one statement of that call — there is
 nothing to share it across, since only one statement per call is accepted.
 
+Every `sqlite3` call runs under a fixed working-memory limit of 256 MiB. A
+query that tries to allocate more than that is stopped and reported as
+`QUERY_TOO_LARGE`, which is a different failure from running out of time
+(`QUERY_TIMEOUT`) or returning too much (`OUTPUT_TOO_LARGE`). The queries this
+catches are the ones that allocate heavily in one place: a large sort,
+`group_concat()` over many rows, `hex()` on a large BLOB.
+
+The limit is verified rather than assumed. SQLite's memory limiter is only
+active in builds that track allocations, and a build where it is compiled out
+accepts the setting and silently ignores it. So the add-on reads back the
+value SQLite reports, checks it as it arrives, and refuses to run the query at
+all if it doesn't match — `HEAP_LIMIT_UNCONFIRMED`.
+
 ## Vault structure on a fresh install
 
 On a **first** run into an empty vault the add-on creates `raw/ha`,

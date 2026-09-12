@@ -12,9 +12,24 @@
  * fts3_tokenizer() — ATTACH matters most, since without it a query reads any
  * file on disk regardless of the vault's own zone check), and the
  * `SELECT * FROM (<sql>) LIMIT <n>` wrapper in query() (single statement,
- * read-only shape, truncation detection). Zone/path checks happen in
- * server.js via the existing resolveSafe() before either function here is
- * called — this module never sees a path outside the vault.
+ * read-only shape, truncation detection).
+ *
+ * schema()/query() do NOT check the path themselves — they trust it. The
+ * `p` argument MUST be the return value of server.js's resolveSafe(), called
+ * before either function here. This module has no idea what the vault root
+ * is and performs no containment check of its own, on purpose (matches
+ * policy.js: neither module duplicates resolveSafe's escape-hardening,
+ * which took two rounds to get right — see its comment on the 2.5.0
+ * symlink/sibling-prefix fix). Calling either function with anything else —
+ * a raw path from args, a path built by hand, a path from a different
+ * dispatcher — reads or reports on any file the process can see, vault or
+ * not; there is nothing in this module that will stop it or even notice.
+ * Confirmed exactly this way in 2.7.1's acceptance: calling query()/schema()
+ * directly, bypassing server.js, read a file outside the vault. Two known
+ * fixes were considered and deferred to a separate release (see
+ * sqlite-spec.md's "Проверка зоны" section) — this file has not changed to
+ * address it, so the trust-the-caller behaviour above is not a stale comment,
+ * it is still exactly how this module works today.
  *
  * Called the same way server.js calls pdftotext/pdftoppm for read_pdf_text/
  * read_pdf_page: execFile with an argv array (SQL is one argv element, never
