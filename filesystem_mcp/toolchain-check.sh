@@ -11,10 +11,12 @@
 set -eu
 
 # Ожидаемые мажоры (Alpine 3.22-stable на 2026-07-21:
-# nodejs 22.23.0-r0 (main), poppler 25.04.0-r0 (main, -utils сабпакет)).
+# nodejs 22.23.0-r0 (main), poppler 25.04.0-r0 (main, -utils сабпакет);
+# Alpine 3.22 main на 2025-07-20: sqlite 3.49.2-r1).
 # Патчи внутри ветки допустимы, смена мажора — нет.
 EXPECT_NODE_MAJOR=22
 EXPECT_POPPLER_MAJOR=25
+EXPECT_SQLITE_MAJOR=3
 
 MANIFEST=/toolchain.txt
 
@@ -22,6 +24,8 @@ collect() {
   NODE_V=$(node -v 2>/dev/null | sed 's/^v//' || echo '?')
   POPPLER_V=$(pdftotext -v 2>&1 | sed -n 's/^pdftotext version \([0-9][0-9.]*\).*/\1/p' | head -1)
   [ -n "${POPPLER_V:-}" ] || POPPLER_V='?'
+  SQLITE_V=$(sqlite3 -version 2>/dev/null | awk '{print $1}')
+  [ -n "${SQLITE_V:-}" ] || SQLITE_V='?'
 }
 
 major() { echo "$1" | sed 's/[.-].*//'; }
@@ -34,11 +38,14 @@ guard() {
   if [ "$(major "$POPPLER_V")" != "$EXPECT_POPPLER_MAJOR" ]; then
     echo "TOOLCHAIN GUARD: poppler $POPPLER_V, ожидался мажор $EXPECT_POPPLER_MAJOR" >&2; rc=1
   fi
+  if [ "$(major "$SQLITE_V")" != "$EXPECT_SQLITE_MAJOR" ]; then
+    echo "TOOLCHAIN GUARD: sqlite3 $SQLITE_V, ожидался мажор $EXPECT_SQLITE_MAJOR" >&2; rc=1
+  fi
   if [ "$rc" != 0 ]; then
     echo "" >&2
     echo "Сборка остановлена: Alpine отдал не тот тулчейн, на котором аддон" >&2
-    echo "проверен. Прогони read_pdf_text/read_pdf_page вручную, убедись что" >&2
-    echo "всё работает, и обнови EXPECT_*_MAJOR в toolchain-check.sh." >&2
+    echo "проверен. Прогони read_pdf_text/read_pdf_page/sqlite_query вручную," >&2
+    echo "убедись что всё работает, и обнови EXPECT_*_MAJOR в toolchain-check.sh." >&2
     exit 1
   fi
 }
@@ -102,6 +109,18 @@ PDF_EOF
   # pdftotext: РОВНО те флаги, что в server.js pdfToText()
   pdftotext -layout -f 1 -l 1 "$T/smoke.pdf" - | grep -q 'VMCP-SMOKE-OK' \
     || { echo "SMOKE FAIL: pdftotext не извлёк маркер" >&2; exit 1; }
+
+  # sqlite3: та же командная строка, что sqlite.js использует в runSqlite()
+  sqlite3 "$T/smoke.db" "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);" \
+    || { echo "SMOKE FAIL: не удалось создать тестовую базу" >&2; exit 1; }
+  sqlite3 -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t" | grep -q '"n":3' \
+    || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json не вернул ожидаемый COUNT(*)" >&2; exit 1; }
+
+  # -safe должна отбивать ATTACH — без этого запрос читает любой файл на
+  # диске в обход проверки зон (см. sqlite-spec.md). Успешный ATTACH — провал.
+  if sqlite3 -readonly -safe "$T/smoke.db" "ATTACH '/etc/passwd' AS x;" >/dev/null 2>&1; then
+    echo "SMOKE FAIL: -safe не заблокировал ATTACH" >&2; exit 1
+  fi
 }
 
 collect
@@ -114,11 +133,13 @@ case "${1:-runtime}" in
       echo "nodejs: $NODE_V"
       echo "poppler(pdftotext/pdftoppm/pdfinfo): $POPPLER_V"
       echo "pdf-pipeline(pdfinfo+pdftoppm+pdftotext): ok"
+      echo "sqlite3: $SQLITE_V"
+      echo "sqlite-pipeline(readonly+safe+json, ATTACH blocked): ok"
     } > "$MANIFEST"
     echo "Toolchain OK -> $(tr '\n' '; ' < "$MANIFEST")"
     ;;
   runtime)
-    echo "node $NODE_V | poppler $POPPLER_V"
+    echo "node $NODE_V | poppler $POPPLER_V | sqlite3 $SQLITE_V"
     ;;
   *)
     echo "usage: $0 build|runtime" >&2; exit 2

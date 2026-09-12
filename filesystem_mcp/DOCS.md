@@ -129,7 +129,8 @@ make the marker unreadable and lock the zone permanently from the tool side.
 
 Reading: `read_text_file` (whole file, `head`/`tail`, or an `offset`/`limit`
 range that also reports line count and `rev`), `read_multiple_files`,
-`read_media_file`, `read_pdf_text`, `read_pdf_page`, `grep_files`.
+`read_media_file`, `read_pdf_text`, `read_pdf_page`, `grep_files`,
+`sqlite_schema`, `sqlite_query`.
 
 Writing: `write_file`, `edit_file` (literal `oldText` replacement or
 line-addressed edits under an optimistic lock), `create_directory`, `move_file`,
@@ -153,6 +154,28 @@ cache can sit further out than that, and the connector has to be re-registered.
 The cheap tell is the `rev` parameter on `write_file`, not the number of tools:
 `rev` arrived with 2.6.0 and nothing else adds it, whereas the tool count has
 moved for unrelated reasons across versions and is easy to misremember.
+
+## SQLite tools
+
+`sqlite_schema` and `sqlite_query` open the file with `sqlite3 -readonly -safe`:
+writes are impossible, and `-safe` disables `ATTACH`, `.shell`, `.open`,
+`load_extension()` and the rest of the escape hatches, so a query cannot reach
+outside the vault's own zone check through SQL.
+
+`sqlite_schema`'s `counts_timeout_ms` is a **per-table** budget, not a pool
+shared across tables — each table gets its own full window, so one slow table
+never eats into another's. But the window covers the *whole* per-table call:
+spawning `sqlite3`, opening the database file, and running `COUNT(*)` — not
+just the count itself. On a large database file, opening it can alone take
+longer than an aggressive budget, so a very small `counts_timeout_ms` can time
+out even a table with a handful of rows; that is the fixed per-invocation cost
+dominating, not the row count, and it is not a sign the per-table budgeting is
+broken. A table that times out is `null` in `counts`; every such table is
+listed once in `counts_incomplete.tables`, with a single shared explanation in
+`counts_incomplete.note` rather than the same sentence repeated per table.
+
+`sqlite_query`'s `timeout_ms` bounds the one statement of that call — there is
+nothing to share it across, since only one statement per call is accepted.
 
 ## Vault structure on a fresh install
 

@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.7.0
+
+**Read-only SQLite.** A `.db` file in the vault can now be inspected and
+queried. Two tools: `sqlite_schema` returns the DDL of everything in the file
+plus the pragmas that describe it, and `sqlite_query` runs a single `SELECT`
+and returns rows. Nothing writes. There is no hidden flag that makes them
+write, and no second stage planned — a database reached over a sync folder is
+not a safe thing to modify, and a tool that can corrupt a backup is worse than
+no tool.
+
+### Added
+
+- `sqlite_schema` — objects with their original DDL, `journal_mode`,
+  `page_size`, `page_count`, `encoding`, `user_version`, `application_id`, the
+  file's size and mtime in UTC and MSK, and whether `-wal` and `-shm` sit
+  alongside. Row counts are **off by default**: `COUNT(*)` is a full scan.
+  With `counts: true` each table gets its own `counts_timeout_ms` budget
+  (default 60000). A table that runs out returns `null` and is named in
+  `counts_incomplete`; the rest of the schema still comes back. The budget
+  covers spawning `sqlite3` and opening the database, not just the count
+  itself, so a very small budget fails every table regardless of its size.
+  Row count predicts count time poorly — which indexes exist matters more.
+- `sqlite_query` — one statement, wrapped so that overflow is detectable:
+  ask for `limit` rows and you are told plainly when there were more.
+  `timeout_ms` kills a runaway query. Output is capped; a result too large to
+  return is an error, never a silent partial answer.
+
+### How it refuses
+
+Both tools go through the `sqlite3` binary in read-only safe mode. Safe mode
+matters for more than writes: it blocks `ATTACH`, which would otherwise let a
+query read any file on the host and walk straight around the zone policy. Dot
+commands, `writefile()`, `edit()` and extension loading are refused with it.
+
+Statements are checked before they run and each refusal says which rule was
+hit: a dot command, more than one statement, or something that isn't a
+`SELECT`, `WITH`, `VALUES` or `EXPLAIN`. The multi-statement check is a plain
+search for `;`, so a query carrying a semicolon inside a string literal is
+refused too. That is a real limitation and it fails loudly rather than being
+parsed heuristically.
+
+A file is identified by its first sixteen bytes, not by its extension. A
+SQLite database named `.fydb` works; a text file named `.db` is rejected with
+its header quoted back.
+
+### Notes
+
+- BLOB columns are returned as-is and will be unreadable in JSON. Wrap them:
+  `hex(col)` or `length(col)`.
+- An uncheckpointed database with a `-wal` beside it reads fine as long as the
+  containing directory is writable, because SQLite creates the `-shm` index
+  itself; reading one leaves that `-shm` behind. Where the directory denies
+  writes — a read-only mount, a share without write permission — the open
+  fails and `WAL_PRESENT_READONLY` explains why instead of passing SQLite's
+  "attempt to write a readonly database" through unhelpfully.
+- No new npm dependencies. The image gains the `sqlite` package; the toolchain
+  check guards its major version at build time and verifies that safe mode
+  really does refuse `ATTACH`.
+
+Everything else is unchanged from 2.6.0.
+
 ## 2.6.0
 
 **Write policies.** A directory can now be marked read-only, or made to require

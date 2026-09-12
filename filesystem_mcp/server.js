@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const P = require('./policy');
+const SQLITE = require('./sqlite');
 
 // grep_files runs in a forked copy of THIS file (argv: --grep-worker <vault>).
 // Rationale: node has no way to time out a regex. A catastrophically
@@ -499,6 +500,33 @@ const TOOLS = [
     }
   },
   {
+    name: 'sqlite_schema',
+    description: 'Inspect a SQLite database file: schema-neutral, no interpretation of the data. File type is decided by the first 16 bytes, not the extension. Returns table/index/view/trigger DDL from sqlite_master, the journal_mode/page_size/page_count/encoding/user_version/application_id PRAGMAs, the sqlite3 version, whether -wal/-shm siblings exist, plus path/size/mtime (UTC and MSK). counts=true adds COUNT(*) per table, off by default — it is a full scan and can take minutes on a large database. counts_timeout_ms is a PER-TABLE budget covering the whole call (spawning sqlite3 and opening the file, not just the COUNT itself) — on a large database file a very small budget can time out even a tiny table. A table that does not finish is null in counts; every such table is listed in counts_incomplete.tables with one shared counts_incomplete.note, not a message repeated per table. The rest of the schema is always returned in full.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        counts: { type: 'boolean', description: 'Add COUNT(*) per table (full table scan each). Default false.' },
+        counts_timeout_ms: { type: 'number', description: 'Per-table budget (covers spawning sqlite3 + opening the file + the COUNT), not a pool shared across tables. Default 60000, max 600000.' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'sqlite_query',
+    description: 'Run exactly one read-only SQL statement against a SQLite database file (sqlite3 -readonly -safe -json — ATTACH, .shell and other escapes are disabled). Must start with SELECT, WITH, VALUES or EXPLAIN and contain no ";" other than an optional single trailing one — a ";" anywhere else, including inside a string literal, is rejected as multiple statements rather than parsed. The query runs wrapped as SELECT * FROM (<sql>) LIMIT <limit+1>, which also detects truncation. BLOB columns are not converted — use hex(col) or length(col), or the JSON output is garbage.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        sql: { type: 'string' },
+        limit: { type: 'number', description: 'Default 100, max 1000.' },
+        timeout_ms: { type: 'number', description: 'Default 5000, max 30000.' }
+      },
+      required: ['path', 'sql']
+    }
+  },
+  {
     name: 'read_multiple_files',
     description: 'Read several whole files at once.',
     inputSchema: { type: 'object', properties: { paths: { type: 'array', items: { type: 'string' } } }, required: ['paths'] }
@@ -675,6 +703,23 @@ async function callTool(name, args) {
       const header = `Pages ${first}-${last} of ${total}`;
       if (!text) return [{ type: 'text', text: `${header}\n\n(no extractable text — the PDF is likely scanned; use read_pdf_page to view pages as images)` }];
       return [{ type: 'text', text: `${header}\n\n${text}` }];
+    }
+
+    case 'sqlite_schema': {
+      const p = resolveSafe(args.path);
+      // opts is passed straight through with its tool-schema names (counts,
+      // counts_timeout_ms) — no renaming step, so there is nothing here to
+      // typo out of sync with sqlite.js or the inputSchema below.
+      const { path, ...opts } = args;
+      const result = await SQLITE.schema(p, opts);
+      return [{ type: 'text', text: JSON.stringify(result, null, 2) }];
+    }
+
+    case 'sqlite_query': {
+      const p = resolveSafe(args.path);
+      const { path, sql, ...opts } = args;
+      const result = await SQLITE.query(p, sql, opts);
+      return [{ type: 'text', text: JSON.stringify(result, null, 2) }];
     }
 
     case 'read_multiple_files': {

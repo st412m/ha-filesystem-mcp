@@ -30,18 +30,22 @@ ENV ADDON_VERSION=${BUILD_VERSION}
 # ---------------------------------------------------------------------------
 # Тулчейн: nodejs (сервер, без npm-зависимостей) + poppler-utils
 # (pdftotext/pdftoppm/pdfinfo для read_pdf_text / read_pdf_page /
-# read_media_file). npm из списка убран — он не использовался никогда:
-# package.json в образе нет, server.js и proxy.js живут на встроенных модулях.
+# read_media_file) + sqlite (даёт /usr/bin/sqlite3, для sqlite_schema /
+# sqlite_query — read-only, флаг -safe отключает ATTACH и прочие побеги).
+# npm из списка убран — он не использовался никогда: package.json в образе
+# нет, server.js и proxy.js живут на встроенных модулях.
 #
 # Жёстко пинить `pkg=версия-rN` нельзя: Alpine удаляет из ветки старые версии,
 # и такой пин ломает установку у ВСЕХ при первом же security-патче
 # (gitlab.alpinelinux.org/alpine/abuild#9996). Поэтому пакеты плавают внутри
-# ветки, но сборка ПАДАЕТ, если ушёл мажор или если PDF-конвейер перестал
-# работать — см. toolchain-check.sh.
+# ветки, но сборка ПАДАЕТ, если ушёл мажор или если PDF-конвейер или sqlite3
+# перестали работать — см. toolchain-check.sh.
 # Состояние Alpine 3.22-stable на 2026-07-21:
 #   nodejs 22.23.0-r0 (main), poppler 25.04.0-r0 (main, -utils сабпакет)
+# Состояние Alpine 3.22 main на 2025-07-20 (pkgs.alpinelinux.org): sqlite
+#   3.49.2-r1 — даёт sqlite3 с флагом -safe (существует с 3.34, есть в 3.49).
 # ---------------------------------------------------------------------------
-RUN apk add --no-cache nodejs poppler-utils
+RUN apk add --no-cache nodejs poppler-utils sqlite
 
 COPY run.sh /run.sh
 COPY toolchain-check.sh /toolchain-check.sh
@@ -50,6 +54,7 @@ COPY server.js /server.js
 COPY policy.js /policy.js
 COPY policy-ui.js /policy-ui.js
 COPY retention.js /retention.js
+COPY sqlite.js /sqlite.js
 RUN chmod a+x /run.sh /toolchain-check.sh \
     && /toolchain-check.sh build
 

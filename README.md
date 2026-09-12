@@ -243,6 +243,56 @@ Break-even is roughly one search per hundred sessions. The defaults are set for 
 
 MCP clients cache `tools/list` for the lifetime of a conversation, so a chat that was already open keeps the tool list it started with. On 2.5.0 that meant `grep_files` appeared only in a **new** conversation; on 2.5.1 and 2.5.2, where no tools were added, only the *description* of `edit_file` changed — the behaviour itself is not cached, so an already-open chat gets the new semantics while still reading the old description.
 
+## SQLite (read-only)
+
+A SQLite database inside the vault can be inspected and queried. Nothing writes.
+
+`sqlite_schema(path, counts?, counts_timeout_ms?)` returns every object in the
+file with its original DDL, plus `journal_mode`, `page_size`, `page_count`,
+`encoding`, `user_version` and `application_id`, the file's size and mtime, and
+whether a `-wal` or `-shm` sits beside it.
+
+Row counts are off by default, because `COUNT(*)` is a full table scan. With
+`counts: true` every table gets its own `counts_timeout_ms` budget (default
+60000). A table that overruns comes back as `null` and is listed in
+`counts_incomplete`, and the rest of the schema is returned normally. The budget
+covers spawning `sqlite3` and opening the file as well as the count, so a very
+small budget fails every table however tiny. Row count is a weak predictor of
+how long a count takes — available indexes matter more.
+
+`sqlite_query(path, sql, limit?, timeout_ms?)` runs a single statement and
+returns rows. Ask for `limit` rows and you are told explicitly when there were
+more. `timeout_ms` kills a runaway query, and an oversized result is an error
+rather than a silent partial answer.
+
+### What is refused, and why
+
+Queries run through `sqlite3` in read-only safe mode. Safe mode is not only
+about writes: it blocks `ATTACH`, which would otherwise let a query read any
+file on the host and bypass the vault's zone policy entirely. Dot commands,
+`writefile()`, `edit()` and extension loading go with it.
+
+Statements are checked before they run, and each refusal names the rule it hit:
+a leading dot, more than one statement, or a statement that is not `SELECT`,
+`WITH`, `VALUES` or `EXPLAIN`. The multi-statement check is a plain search for
+`;`, so a query with a semicolon inside a string literal is refused as well.
+That is a known limitation; it fails loudly instead of guessing.
+
+File type comes from the first sixteen bytes, not the extension. A database
+named `.fydb` is read; a text file named `.db` is refused with its header
+quoted back.
+
+### Two things worth knowing
+
+BLOB columns come back untouched and will be unreadable inside JSON. Wrap them:
+`hex(col)` or `length(col)`.
+
+A database with an uncheckpointed `-wal` beside it reads fine as long as the
+containing directory is writable, because SQLite builds the `-shm` index itself
+— and reading leaves that `-shm` behind. Where the directory denies writes, a
+read-only mount or a share without write permission, the open fails and
+`WAL_PRESENT_READONLY` says so plainly.
+
 ## Recommended companion apps
 
 For the full Karpathy LLM wiki experience, also install:

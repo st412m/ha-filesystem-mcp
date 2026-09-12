@@ -6,3 +6,4 @@ venv/
 .env
 *.log
 .DS_Store
+sqlite-spec.md
