@@ -172,26 +172,28 @@ GOT=$(sqlite3 -readonly -safe -json "$OUT/wal_hotcopy.db" "SELECT COUNT(*) AS n 
 echo "$GOT" | grep -q '"n":3' \
   || { echo "make-fixtures: FATAL — wal_hotcopy.db did not read back 3 rows under -readonly -safe (got: $GOT)" >&2; exit 1; }
 
-# --- self-check: hard_heap_limit actually stops an unbounded recursive CTE -
-# sitting under an aggregate. SELECT * FROM (<sql>) LIMIT n, the wrapper
-# sqlite_query puts around every call, does not bound this shape: max() has to
-# consume the whole (infinite) input before it can produce its one output row,
-# so the outer LIMIT never gets a chance to matter. Without hard_heap_limit
-# this grows in memory until timeout_ms (up to 30s) or the OOM killer takes
-# the whole add-on process with it.
+# --- self-check: hard_heap_limit actually stops a query that allocates a ---
+# lot in one place: hex(zeroblob(200000000)) forces a single ~400 MB text
+# buffer (200 MB source blob, 2 bytes of hex per source byte), comfortably
+# over the 256 MiB (268435456 byte) limit. This replaces an earlier version
+# that used an unbounded recursive CTE under max() (SELECT max(n) FROM (WITH
+# RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)):
+# measured on the real Alpine binary, that query used sys 0.05s over a full
+# 20s run — an infinite CPU-bound COUNT, not a memory allocation, and 8 MiB
+# was not enough to make it error either. timeout_ms was catching it, and
+# QUERY_TIMEOUT was always the correct answer for that shape, not a defect —
+# see sqlite-spec.md for the corrected premise. hex(zeroblob(N)) is what the
+# spec's own examples of real memory pressure look like (a big sort,
+# group_concat over many rows, hex() on a large BLOB): one allocation, sized
+# up front, nothing to iterate — so it is fast and bounded even where the
+# limiter does not work (confirmed on this machine: resolves in ~100ms
+# instead of hanging), unlike the CTE it replaces.
 #
 # This runs sqlite.js itself (not raw sqlite3) because the thing being checked
 # is OUR error-code mapping (QUERY_TOO_LARGE), not just the underlying SQLite
 # behaviour. It asserts the error is actually raised — it does not skip when
 # the limiter is unavailable, and it will fail on anything other than exactly
-# QUERY_TOO_LARGE. timeout_ms below is 3s, not the tool's own 30s ceiling: on
-# a working limiter (Alpine) hard_heap_limit trips almost immediately, so 3s
-# changes nothing about what actually passes — it only bounds how long this
-# check is allowed to run an unbounded-memory query on a box where the
-# limiter does NOT work (this one, confirmed — see HARD_HEAP_LIMIT_BYTES in
-# sqlite.js), where it will exhaust the 3s and correctly report FATAL. That is
-# a true red, not a reason to soften the assertion — the add-on only ever
-# runs on Alpine, which is where this is meant to actually pass.
+# QUERY_TOO_LARGE.
 CHECK_JS="$OUT/.hard-heap-limit-check.js"
 cat > "$CHECK_JS" <<'JS'
 const path = require('path');
@@ -201,10 +203,10 @@ const dbPath = path.join(process.env.FIXTURES_DIR, 'empty.db');
   try {
     await S.query(
       dbPath,
-      'SELECT max(n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)',
-      { timeout_ms: 3000 }
+      'SELECT length(hex(zeroblob(200000000))) AS n',
+      { timeout_ms: 15000 }
     );
-    console.error('FATAL: unbounded recursive CTE under an aggregate did not error at all — hard_heap_limit is not stopping it');
+    console.error('FATAL: a ~400 MB single allocation did not error at all — hard_heap_limit is not stopping it');
     process.exit(1);
   } catch (e) {
     if (!/^QUERY_TOO_LARGE:/.test(e.message)) {

@@ -187,12 +187,15 @@ function mapSpawnError(err, dbPath, timeoutMs) {
     return new Error(`OUTPUT_TOO_LARGE: sqlite3 output exceeded ${MAX_STDOUT_BYTES} bytes — narrow the column list or lower limit. No partial result is returned.`);
   const msg = (err.stderrSoFar || err.message || '').toString().trim();
   // hard_heap_limit tripped: the query's working memory, not its output, is
-  // the problem — typically an unbounded recursive CTE or a cartesian product
-  // sitting under an aggregate, which LIMIT cannot bound (see the constant's
-  // comment above). Distinct from OUTPUT_TOO_LARGE (a large RESULT) and
-  // QUERY_TIMEOUT (ran too long, however much memory it used).
+  // the problem — a large sort, group_concat() over many rows, hex()/similar
+  // on a large BLOB: something that allocates a lot in one place. Distinct
+  // from OUTPUT_TOO_LARGE (a large RESULT reaching stdout) and QUERY_TIMEOUT
+  // (ran too long, whatever the memory use — an unbounded recursive CTE
+  // under an aggregate is CPU-bound, not memory-bound: measured at sys 0.05s
+  // over a full 20s run on the real Alpine binary, so timeout_ms is its
+  // correct stop, not this one — see sqlite-spec.md).
   if (/out of memory/i.test(msg))
-    return new Error(`QUERY_TOO_LARGE: the query exceeded its working-memory limit (${HARD_HEAP_LIMIT_BYTES} bytes, fixed) and was stopped — typically an unbounded recursive CTE or a cartesian product under an aggregate, which LIMIT cannot bound because the aggregate must consume all input first. Narrow the query.`);
+    return new Error(`QUERY_TOO_LARGE: the query exceeded its working-memory limit (${HARD_HEAP_LIMIT_BYTES} bytes, fixed) and was stopped — something in it allocates a lot in one place (a large sort, group_concat() over many rows, hex()/similar on a large BLOB). Narrow the query or reduce what it aggregates.`);
   // A read-only connection needs to create the -shm wal-index itself when it
   // does not already exist, which needs write access on the DIRECTORY, not
   // the database file (sqlite.org/wal.html). This fails on a read-only
