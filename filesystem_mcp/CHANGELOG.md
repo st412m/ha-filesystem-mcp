@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.7.2
+
+**WAL databases no longer leave side files behind.** Reading a database with
+no `-wal` journal (or an empty leftover one) now opens it in place via
+sqlite3's `immutable=1` URI mode — no `-shm`/`-wal` sibling is created. A
+database with a real `-wal` is instead read from a private, automatically
+removed copy made once per tool call (not once per `sqlite3` spawn — a
+`counts: true` call on a database with a dozen tables no longer copies the
+file a dozen times over). Matters most for a vault synced by Syncthing or
+similar, where every leftover side file used to propagate to every device.
+`immutable=1` is deliberately never used when a journal is present: measured
+against a real hot-copied WAL database, it doesn't error or warn, it just
+silently reads past the journal's content — an empty schema and "no such
+table" instead of the real data.
+
+### Breaking
+
+- **`mtime_msk` is gone.** It hardcoded a fixed MSK+3 offset, which is
+  wrong for anyone else running this add-on. Replaced by `mtime_local`: the
+  container's own local time with an explicit numeric offset (e.g.
+  `2026-09-13 07:31:02 +03:00`), no letter abbreviation, in both
+  `sqlite_schema` and `sqlite_query`.
+
+### Added
+
+- `wal_copy` (boolean) and `wal_copy_ms` (number or `null`) in both
+  `sqlite_schema` and `sqlite_query` responses — whether that call read from
+  a private WAL copy, and how long making it took.
+
+### Changed
+
+- `WAL_PRESENT_READONLY` no longer means "checkpoint the source" — under the
+  new copy-once-per-call scheme the copy's directory is always writable, so
+  the old failure (sqlite3 refusing to create `-shm` on a read-only mount)
+  can't reach this code path anymore. It now fires only if preparing the
+  working copy itself fails (no space, unreadable source, unwritable temp
+  dir), and says so.
+- `test/make-fixtures.sh` converted from bash to plain `sh` — the add-on
+  image has no bash. It now requires `VAULT_PATH` in the environment instead
+  of defaulting to a fixed `/media/VAULT`, and defaults its output
+  directory to `$VAULT_PATH/tmp/fixtures` instead of a path under the repo.
+  Added a regression check that reads the WAL-hotcopy fixture through
+  `sqlite.js` itself and asserts the row data comes back with `wal_copy: true`
+  — the cheapest way to catch a future accidental use of `immutable=1`
+  against a database that actually has a journal.
+
 ## 2.7.1
 
 **A memory ceiling on SQLite queries.** Every `sqlite3` call now runs under a fixed working-memory limit of 256 MiB. A query that tries to allocate more than that is stopped and reported as `QUERY_TOO_LARGE`, which is a different failure from running out of time (`QUERY_TIMEOUT`) or returning too much (`OUTPUT_TOO_LARGE`). The queries this catches are the ones that allocate heavily in one place: a large sort, `group_concat()` over many rows, `hex()` on a large BLOB.

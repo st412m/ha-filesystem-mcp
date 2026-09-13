@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Vault MCP — read-only SQLite inspection (2.7.0)
+ * Vault MCP — read-only SQLite inspection (2.7.0, WAL side-file fix in 2.7.2)
  *
  * Two tools, schema-neutral: sqlite_schema() looks at what is in the file,
  * sqlite_query() runs exactly one read-only statement. Neither interprets the
@@ -13,6 +13,14 @@
  * file on disk regardless of the vault's own zone check), and the
  * `SELECT * FROM (<sql>) LIMIT <n>` wrapper in query() (single statement,
  * read-only shape, truncation detection).
+ *
+ * 2.7.2 adds a fourth concern, orthogonal to the three above: how the file
+ * gets opened at all. A plain `-readonly` open of a WAL-mode database still
+ * creates a `-shm` and (if missing) a `-wal` sibling next to it — harmless on
+ * its own, but the add-on's main use case is a vault synced by Syncthing,
+ * where every read then propagates two new files to every other device. See
+ * prepareOpen() below for the fix (immutable URI or a private copy) and
+ * sqlite-spec-272.md §1 for the measurement behind it.
  *
  * schema()/query() do NOT check the path themselves — they trust it. The
  * `p` argument MUST be the return value of server.js's resolveSafe(), called
@@ -110,12 +118,20 @@ function clampInt(v, def, min, max, name) {
   return t;
 }
 
-// His timezone is fixed MSK = UTC+3, no DST — no Intl/tz-data dependency.
-function toMskString(d) {
-  const msk = new Date(d.getTime() + 3 * 3600 * 1000);
+// This add-on is public and its vault is not always read from the same
+// machine or timezone — a hardcoded MSK offset (2.7.0/2.7.1's mtime_msk) is
+// wrong for anyone else and was removed in 2.7.2 (breaking response-format change, see
+// CHANGELOG.md). This reads the container's own local time via plain Date
+// getters (respecting its TZ, whatever that is) and appends the numeric
+// offset instead of a fixed abbreviation — no Intl/tz-data dependency.
+function toLocalOffsetString(d) {
+  const offMin = -d.getTimezoneOffset();
+  const sign = offMin >= 0 ? '+' : '-';
+  const abs = Math.abs(offMin);
   const p2 = n => String(n).padStart(2, '0');
-  return `${msk.getUTCFullYear()}-${p2(msk.getUTCMonth() + 1)}-${p2(msk.getUTCDate())} ` +
-         `${p2(msk.getUTCHours())}:${p2(msk.getUTCMinutes())}:${p2(msk.getUTCSeconds())} MSK`;
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
+         `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())} ` +
+         `${sign}${p2(Math.floor(abs / 60))}:${p2(abs % 60)}`;
 }
 
 function quoteIdent(name) {
@@ -165,6 +181,81 @@ function checkSqliteHeader(p) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Where to open the file from: the original path via an `immutable=1` URI, or
+// a private copy of it plus its `-wal`. Decided ONCE per tool call (by
+// schema()/query(), not by runSqlite()) — sqlite_schema with counts:true
+// spawns sqlite3 once per table, and copying inside that per-spawn helper
+// would make one call to a database with a dozen tables copy a
+// possibly-hundreds-of-MB file a dozen times over.
+// ---------------------------------------------------------------------------
+
+// Percent-encodes one path segment at a time so sqlite3's URI parser doesn't
+// choke on a space, `?`, `#` or `%` in the file name, while the `/`
+// separators between segments stay literal. Encoding a character that didn't
+// need it is harmless — sqlite3 percent-decodes the whole thing before use.
+function encodeSqliteUriPath(p) {
+  return p.split('/').map(encodeURIComponent).join('/');
+}
+
+function buildImmutableUri(p) {
+  return `file:${encodeSqliteUriPath(p)}?immutable=1`;
+}
+
+// A zero-length -wal is this module's own past artifact (or some other
+// reader's), not a real journal — treating it as "journal present" would
+// permanently exile that database to the copy path over nothing forever
+// after. No sibling at all reads the same way: no journal either way.
+function walIsPresent(origPath) {
+  try { return fs.statSync(`${origPath}-wal`).size > 0; }
+  catch { return false; }
+}
+
+// No journal → open the ORIGINAL file in place through `immutable=1`: sqlite3
+// skips locking and the -shm/-wal dance entirely, so a database living in a
+// synced folder gains no sibling files from being read (measured on the real
+// Alpine binary — sqlite-spec-272.md §1). This is deliberately not used when
+// a real -wal sits next to the file: immutable tells sqlite3 the file will
+// not change and nothing needs replaying, so it reads past an uncheckpointed
+// journal's content rather than through it — on a database whose schema
+// lives entirely in the -wal this comes back as an empty schema and "no such
+// table", not a warning (confirmed against wal_hotcopy.db; see the matching
+// regression test in the test matrix). So when a journal is present, the
+// main file and its -wal are copied together into a fresh directory made for
+// this call and opened from there instead — new -shm/-wal siblings are only
+// ever allowed to appear in that throwaway copy, which is removed whole
+// afterwards. -shm is not copied: it is a regenerable lock/index structure,
+// not data, and the copy's directory is always writable.
+function prepareOpen(origPath) {
+  if (!walIsPresent(origPath)) {
+    return { openPath: buildImmutableUri(origPath), cleanup: () => {}, viaCopy: false, copyMs: null };
+  }
+  const t0 = Date.now();
+  let tmpDir;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-sqlite-copy-'));
+    const dstDb = path.join(tmpDir, path.basename(origPath));
+    fs.copyFileSync(origPath, dstDb);
+    fs.copyFileSync(`${origPath}-wal`, `${dstDb}-wal`);
+    return {
+      openPath: dstDb,
+      cleanup: () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} },
+      viaCopy: true,
+      copyMs: Date.now() - t0,
+    };
+  } catch (e) {
+    if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    // Not a checkpoint problem (the copy destination is our own temp dir,
+    // always writable) — this is our own copy step failing: no space left,
+    // source unreadable, temp dir not writable. Kept as WAL_PRESENT_READONLY
+    // for the error code's continuity, but the text is now about the copy,
+    // not about checkpointing — see sqlite-spec-272.md §3. Known-uncovered
+    // synthetically, same as before: nothing in test/ makes mkdtempSync or
+    // copyFileSync fail on purpose.
+    throw new Error(`WAL_PRESENT_READONLY: could not prepare a working copy of ${origPath} alongside its -wal journal — ${e.message}`);
+  }
+}
+
 // Low-level spawn, shared by every call into sqlite3. execFile — no shell,
 // argv array, SQL is one argv element. stdin is explicitly closed: sqlite3
 // does not read it when SQL is given as an argument, but nothing here should
@@ -195,7 +286,7 @@ function spawnSqlite3(args, { timeoutMs, maxBuffer } = {}) {
   });
 }
 
-function mapSpawnError(err, dbPath, timeoutMs) {
+function mapSpawnError(err, timeoutMs) {
   if (err.code === 'ENOENT') return new Error('SQLITE_MISSING: sqlite3 binary not found on PATH');
   if (err.timedOut) return new Error(`QUERY_TIMEOUT: query killed after ${timeoutMs} ms`);
   if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(err.message || ''))
@@ -211,19 +302,16 @@ function mapSpawnError(err, dbPath, timeoutMs) {
   // correct stop, not this one — see sqlite-spec.md).
   if (/out of memory/i.test(msg))
     return new Error(`QUERY_TOO_LARGE: the query exceeded its working-memory limit (${HARD_HEAP_LIMIT_BYTES} bytes, fixed) and was stopped — something in it allocates a lot in one place (a large sort, group_concat() over many rows, hex()/similar on a large BLOB). Narrow the query or reduce what it aggregates.`);
-  // A read-only connection needs to create the -shm wal-index itself when it
-  // does not already exist, which needs write access on the DIRECTORY, not
-  // the database file (sqlite.org/wal.html). This fails on a read-only
-  // bind-mount, a share mounted without write permission, or a full volume —
-  // sqlite3's own message there ("attempt to write a readonly database" /
-  // "unable to open database file") reads like a bug in this server, not a
-  // property of the mount, so it is recognized and replaced.
-  // Known gap: not reproducible synthetically, and not under root (which
-  // ignores Unix permission bits) — no fixture in test/ exercises this
-  // branch; see test/make-fixtures.sh.
-  if (/attempt to write a readonly database|unable to open database file/i.test(msg) && fs.existsSync(`${dbPath}-wal`)) {
-    return new Error(`WAL_PRESENT_READONLY: ${dbPath} has not been checkpointed and a -wal journal sits next to it. Copy both the database file and its -wal (and -shm, if present) together, or checkpoint the source database first.`);
-  }
+  // WAL_PRESENT_READONLY no longer comes from here (matching sqlite3's own
+  // "attempt to write a readonly database" / "unable to open database file"
+  // text against a -wal sibling, as in 2.7.1). Since 2.7.2 dbPath is always
+  // either opened `immutable=1` (no journal, nothing to write) or is already
+  // a copy of the original sitting in our own always-writable temp dir (a
+  // real journal was present) — see prepareOpen(). That open failing for a
+  // read-only-directory reason should no longer happen; if it does, it falls
+  // through to the generic SQLITE_ERROR below rather than a wrong-sounding
+  // dedicated one. The dedicated code is now raised directly by prepareOpen()
+  // when the copy step itself fails.
   return new Error(`SQLITE_ERROR: ${msg}`);
 }
 
@@ -295,11 +383,15 @@ function heapLimitUnconfirmedError(gotSoFar) {
 // real chance to grow. This is why runSqlite() cannot share spawnSqlite3()
 // (execFile only hands back stdout once the process has already exited);
 // sqliteVersion() has no query to protect against and keeps using it.
-function runSqliteChecked(dbPath, sql, timeoutMs) {
+function runSqliteChecked(openPath, sql, timeoutMs) {
   return new Promise((resolve, reject) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-sqlite-'));
     const cleanup = () => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} };
-    const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-readonly', '-safe', '-json', dbPath, sql];
+    // openPath is whatever prepareOpen() decided for this call: a `file:...
+    // ?immutable=1` URI, or the path of our own copy — sqlite3 parses the URI
+    // form on this build without needing a `-uri` flag (that flag does not
+    // exist on Alpine's sqlite3 3.49.2 at all — confirmed, do not add it).
+    const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-readonly', '-safe', '-json', openPath, sql];
 
     let child;
     try {
@@ -362,15 +454,16 @@ function runSqliteChecked(dbPath, sql, timeoutMs) {
   });
 }
 
-async function runSqlite(dbPath, sql, timeoutMs) {
+async function runSqlite(openPath, sql, timeoutMs) {
   // Every caller goes through here, so sqlite_schema's DDL/PRAGMA queries and
   // every table's COUNT(*) get the same limit and the same streamed
-  // confirmation that sqlite_query does.
+  // confirmation that sqlite_query does. openPath is prepareOpen()'s result,
+  // decided once per tool call — never the original path directly.
   let res;
-  try { res = await runSqliteChecked(dbPath, sql, timeoutMs); }
+  try { res = await runSqliteChecked(openPath, sql, timeoutMs); }
   catch (err) {
     if (err.heapLimitUnconfirmed) throw err; // already a finished HEAP_LIMIT_UNCONFIRMED Error
-    throw mapSpawnError(err, dbPath, timeoutMs);
+    throw mapSpawnError(err, timeoutMs);
   }
   return parseJsonRows(res.stdout);
 }
@@ -380,7 +473,7 @@ async function sqliteVersion() {
   if (cachedVersion) return cachedVersion;
   let res;
   try { res = await spawnSqlite3(['-version']); }
-  catch (err) { throw mapSpawnError(err, '', 0); }
+  catch (err) { throw mapSpawnError(err, 0); }
   cachedVersion = res.stdout.trim().split(/\s+/)[0] || res.stdout.trim();
   return cachedVersion;
 }
@@ -399,58 +492,69 @@ async function schema(p, opts) {
   const st = assertRegularFile(p);
   checkSqliteHeader(p);
 
-  const version = await sqliteVersion();
-  const objects = await runSqlite(p, SQLITE_MASTER_QUERY);
-  const pragmaRows = await runSqlite(p, PRAGMA_QUERY);
-  const pragmas = pragmaRows[0] || { journal_mode: null, page_size: null, page_count: null, encoding: null, user_version: null, application_id: null };
+  // One open decision for the whole call — not one per spawn. counts:true
+  // spawns sqlite3 once per table (thirteen times on the recorder database);
+  // deciding immutable-vs-copy inside runSqlite() would copy the file that
+  // many times over for one sqlite_schema call. See prepareOpen().
+  const { openPath, cleanup, viaCopy, copyMs } = prepareOpen(p);
+  try {
+    const version = await sqliteVersion();
+    const objects = await runSqlite(openPath, SQLITE_MASTER_QUERY);
+    const pragmaRows = await runSqlite(openPath, PRAGMA_QUERY);
+    const pragmas = pragmaRows[0] || { journal_mode: null, page_size: null, page_count: null, encoding: null, user_version: null, application_id: null };
 
-  let counts = null, incompleteTables = null;
-  if (wantCounts) {
-    counts = {};
-    const tableNames = objects.filter(o => o.type === 'table').map(o => o.name);
-    for (const name of tableNames) {
-      // Each table gets its OWN full counts_timeout_ms window — one slow table
-      // (a full scan on a large one) must not take the rest of the schema down
-      // with it, and a fast table is not charged for a slow neighbour. The
-      // window covers the whole per-table call (spawning sqlite3, opening the
-      // database file, running COUNT(*)), not just the count itself, so on a
-      // large database file a very small window can time out even a table
-      // with a handful of rows — see DOCS.md. counts stays number|null
-      // throughout; which tables timed out goes in incompleteTables as a
-      // plain list, not a duplicated per-table message (a base with dozens of
-      // tables would otherwise repeat the same sentence dozens of times).
-      try {
-        const rows = await runSqlite(p, `SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`, countsTimeoutMs);
-        counts[name] = rows.length ? Object.values(rows[0])[0] : null;
-      } catch (e) {
-        if (/^QUERY_TIMEOUT:/.test(e.message)) {
-          counts[name] = null;
-          (incompleteTables = incompleteTables || []).push(name);
-        } else {
-          throw e;
+    let counts = null, incompleteTables = null;
+    if (wantCounts) {
+      counts = {};
+      const tableNames = objects.filter(o => o.type === 'table').map(o => o.name);
+      for (const name of tableNames) {
+        // Each table gets its OWN full counts_timeout_ms window — one slow table
+        // (a full scan on a large one) must not take the rest of the schema down
+        // with it, and a fast table is not charged for a slow neighbour. The
+        // window covers the whole per-table call (spawning sqlite3, opening the
+        // database file, running COUNT(*)), not just the count itself, so on a
+        // large database file a very small window can time out even a table
+        // with a handful of rows — see DOCS.md. counts stays number|null
+        // throughout; which tables timed out goes in incompleteTables as a
+        // plain list, not a duplicated per-table message (a base with dozens of
+        // tables would otherwise repeat the same sentence dozens of times).
+        try {
+          const rows = await runSqlite(openPath, `SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`, countsTimeoutMs);
+          counts[name] = rows.length ? Object.values(rows[0])[0] : null;
+        } catch (e) {
+          if (/^QUERY_TIMEOUT:/.test(e.message)) {
+            counts[name] = null;
+            (incompleteTables = incompleteTables || []).push(name);
+          } else {
+            throw e;
+          }
         }
       }
     }
-  }
-  const countsIncomplete = incompleteTables && {
-    tables: incompleteTables,
-    note: `COUNT(*) did not finish within counts_timeout_ms=${countsTimeoutMs} — raise it, or count one table via sqlite_query`,
-  };
+    const countsIncomplete = incompleteTables && {
+      tables: incompleteTables,
+      note: `COUNT(*) did not finish within counts_timeout_ms=${countsTimeoutMs} — raise it, or count one table via sqlite_query`,
+    };
 
-  return {
-    path: p,
-    size: st.size,
-    mtime_utc: st.mtime.toISOString(),
-    mtime_msk: toMskString(st.mtime),
-    sqlite3_version: version,
-    pragmas,
-    objects,
-    wal_present: fs.existsSync(`${p}-wal`),
-    shm_present: fs.existsSync(`${p}-shm`),
-    counts,
-    counts_incomplete: countsIncomplete,
-    elapsed_ms: Date.now() - t0,
-  };
+    return {
+      path: p,
+      size: st.size,
+      mtime_utc: st.mtime.toISOString(),
+      mtime_local: toLocalOffsetString(st.mtime),
+      sqlite3_version: version,
+      pragmas,
+      objects,
+      wal_present: fs.existsSync(`${p}-wal`),
+      shm_present: fs.existsSync(`${p}-shm`),
+      wal_copy: viaCopy,
+      wal_copy_ms: copyMs,
+      counts,
+      counts_incomplete: countsIncomplete,
+      elapsed_ms: Date.now() - t0,
+    };
+  } finally {
+    cleanup();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,9 +600,15 @@ async function query(p, rawSql, opts) {
   // by SQLite normally.
   const wrapped = `SELECT * FROM (${sql}) LIMIT ${limit + 1}`;
 
-  const t0 = Date.now();
-  const rows = await runSqlite(p, wrapped, timeoutMs);
-  const elapsedMs = Date.now() - t0;
+  const { openPath, cleanup, viaCopy, copyMs } = prepareOpen(p);
+  let rows, elapsedMs;
+  try {
+    const t0 = Date.now();
+    rows = await runSqlite(openPath, wrapped, timeoutMs);
+    elapsedMs = Date.now() - t0;
+  } finally {
+    cleanup();
+  }
 
   const truncated = rows.length > limit;
   const clipped = truncated ? rows.slice(0, limit) : rows;
@@ -507,7 +617,9 @@ async function query(p, rawSql, opts) {
     path: p,
     size: st.size,
     mtime_utc: st.mtime.toISOString(),
-    mtime_msk: toMskString(st.mtime),
+    mtime_local: toLocalOffsetString(st.mtime),
+    wal_copy: viaCopy,
+    wal_copy_ms: copyMs,
     columns: clipped.length ? Object.keys(clipped[0]) : [],
     rows: clipped,
     row_count: clipped.length,

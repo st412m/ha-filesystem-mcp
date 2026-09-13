@@ -155,12 +155,48 @@ The cheap tell is the `rev` parameter on `write_file`, not the number of tools:
 `rev` arrived with 2.6.0 and nothing else adds it, whereas the tool count has
 moved for unrelated reasons across versions and is easy to misremember.
 
+Starting a **new conversation** is not always enough by itself, either: some
+clients cache `tools/list` per client *session*, not per conversation, and a
+new conversation opened after the add-on restarted may reuse that session
+without ever re-fetching the list — new tools then stay invisible, which
+reads like "the feature never shipped" rather than a stale cache. A full
+client-session reset (not just a new chat) clears it. With `log_requests:
+true`, the `tools/list` response is a recognizable fingerprint in the log —
+it weighs around 7 KB and nothing else on this server does; if calls are
+coming in but that response never appears after a restart, the client is
+still working from an old list.
+
 ## SQLite tools
 
 `sqlite_schema` and `sqlite_query` open the file with `sqlite3 -readonly -safe`:
 writes are impossible, and `-safe` disables `ATTACH`, `.shell`, `.open`,
 `load_extension()` and the rest of the escape hatches, so a query cannot reach
 outside the vault's own zone check through SQL.
+
+### Opening a database with a WAL journal
+
+A plain `-readonly` open of a WAL-mode database still creates a `-shm` file
+(and a `-wal`, if none exists yet) next to it — harmless on its own, but the
+common case for this add-on is a vault synced by Syncthing or similar, where
+every read then propagates two new files to every other device. Since 2.7.2:
+
+- No `-wal` next to the database, or an empty one (a leftover from before this
+  fix, or from some other reader — not a real journal either way) — the file
+  is opened in place via `sqlite3`'s `immutable=1` URI mode. No sibling files
+  appear, and none are removed either, because none are created.
+- A real, non-empty `-wal` — the database and its `-wal` are copied together
+  into a private temporary directory for the duration of the call and read
+  from there; the copy (and anything sqlite3 creates alongside it) is removed
+  when the call finishes, success or failure. `immutable=1` is deliberately
+  **not** used here: it tells sqlite3 the file will not change and nothing
+  needs replaying, so on a database whose schema or rows live entirely in an
+  uncheckpointed `-wal` it comes back with an empty schema or "no such table"
+  — silently wrong, not an error.
+
+Every response carries `wal_copy` (whether this call read from such a copy)
+and `wal_copy_ms` (how long making it took, `null` when no copy was made) —
+useful when one call is instant and the next on the same kind of database
+takes noticeably longer for no obvious reason.
 
 `sqlite_schema`'s `counts_timeout_ms` is a **per-table** budget, not a pool
 shared across tables — each table gets its own full window, so one slow table

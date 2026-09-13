@@ -35,9 +35,10 @@ Home Assistant app that exposes a local directory as an MCP (Model Context Proto
 
 ## Where to put your vault
 
-Two options, pick the one that fits your hardware:
+The vault's location is the `vault_path` option — anywhere under `/media` or
+`/share` works. Two common choices, pick the one that fits your hardware:
 
-### Option A: External USB drive at `/media/VAULT` (recommended for dedicated storage)
+### Option A: External USB drive, mounted at `/media/VAULT` in this guide (recommended for dedicated storage)
 
 #### 1. Format the drive as ext4
 
@@ -122,7 +123,7 @@ Watch the log during a registration attempt: requests from Anthropic's published
 
 ## What happens on first run
 
-The app automatically creates the following structure inside your vault if it doesn't exist yet:
+The app automatically creates the following structure inside your vault if it doesn't exist yet (shown at the default `vault_path`, `/media/VAULT` — yours may differ):
 
 ```
 /media/VAULT/
@@ -243,14 +244,29 @@ Break-even is roughly one search per hundred sessions. The defaults are set for 
 
 MCP clients cache `tools/list` for the lifetime of a conversation, so a chat that was already open keeps the tool list it started with. On 2.5.0 that meant `grep_files` appeared only in a **new** conversation; on 2.5.1 and 2.5.2, where no tools were added, only the *description* of `edit_file` changed — the behaviour itself is not cached, so an already-open chat gets the new semantics while still reading the old description.
 
+A new conversation is not always enough on its own, either: some clients cache
+`tools/list` per *client session*, not per conversation, so a new chat opened
+right after the add-on restarts can still be served the old list without ever
+re-fetching it — new tools then simply don't appear, which looks like the
+update never shipped. If that happens, reset the client session itself (fully
+sign out/in, or re-register the connector), not just the conversation. With
+`log_requests: true` you can tell the two apart: the `tools/list` response is
+around 7 KB and nothing else this server sends is that size, so its presence
+or absence in the log right after a restart says whether the client actually
+asked for the new list.
+
 ## SQLite (read-only)
 
 A SQLite database inside the vault can be inspected and queried. Nothing writes.
 
 `sqlite_schema(path, counts?, counts_timeout_ms?)` returns every object in the
 file with its original DDL, plus `journal_mode`, `page_size`, `page_count`,
-`encoding`, `user_version` and `application_id`, the file's size and mtime, and
-whether a `-wal` or `-shm` sits beside it.
+`encoding`, `user_version` and `application_id`, the file's size and mtime
+(UTC and local with a numeric offset, e.g. `+03:00`), and whether a `-wal` or
+`-shm` sits beside the **original** file — reading it through this tool never
+adds one. A database with a real `-wal` journal is read from a private,
+automatically-removed copy instead of in place; `wal_copy` and `wal_copy_ms`
+in the response say whether that happened for this call and how long it took.
 
 Row counts are off by default, because `COUNT(*)` is a full table scan. With
 `counts: true` every table gets its own `counts_timeout_ms` budget (default
@@ -263,7 +279,8 @@ how long a count takes — available indexes matter more.
 `sqlite_query(path, sql, limit?, timeout_ms?)` runs a single statement and
 returns rows. Ask for `limit` rows and you are told explicitly when there were
 more. `timeout_ms` kills a runaway query, and an oversized result is an error
-rather than a silent partial answer.
+rather than a silent partial answer. Same `wal_copy`/`wal_copy_ms` reporting
+as `sqlite_schema`.
 
 ### What is refused, and why
 
@@ -322,7 +339,7 @@ proxy.js (token auth, /mcp only, optional request logging)
     ↓ HTTP :3099
 server.js (MCP StreamableHTTP)
     ↓
-/media/VAULT/ (your files)
+vault_path (your files — /media/VAULT by default)
     ↑
 policy-ui.js (:3101, ingress only, writes .vault-policy)
     ↑ HTTP, 172.30.32.2 only

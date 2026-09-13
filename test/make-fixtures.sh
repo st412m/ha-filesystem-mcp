@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Builds throwaway test databases for sqlite_schema / sqlite_query
 # (filesystem_mcp/sqlite.js). Output is regenerated on every run — nothing
 # here is committed, these are binaries that would just rot in the repo.
@@ -7,11 +7,26 @@
 # plain pipe with a trailing `sleep` keeps the writer's stdin open, which
 # works the same on Linux, macOS and Git-Bash/MSYS on Windows.
 #
-# Usage: test/make-fixtures.sh [output-dir]   (default: test/fixtures)
+# /media/VAULT is one particular vault_path, not a constant of this add-on —
+# anyone else's vault lives somewhere else (a tester's was on a Raspberry Pi,
+# under a different mount entirely). VAULT_PATH is required, not defaulted:
+#
+#   VAULT_PATH=/media/VAULT test/make-fixtures.sh
+#   VAULT_PATH=/share/vault test/make-fixtures.sh /share/vault/tmp/fixtures
+#
+# Usage: test/make-fixtures.sh [output-dir]   (default: $VAULT_PATH/tmp/fixtures)
+#
+# 2.7.2: converted from bash to plain sh (the add-on image has no bash; every
+# prior run of this script started with `apk add bash` by hand first). No
+# bashism survived that couldn't be dropped without losing meaning — the only
+# one removed is `pipefail`, and nothing here relies on it: every pipe below
+# ends in the command whose exit status actually matters, which plain `set -e`
+# already catches.
 
-set -euo pipefail
+set -eu
 
-OUT="${1:-$(dirname "$0")/fixtures}"
+: "${VAULT_PATH:?VAULT_PATH must be set — see the usage note above}"
+OUT="${1:-$VAULT_PATH/tmp/fixtures}"
 mkdir -p "$OUT"
 
 command -v sqlite3 >/dev/null 2>&1 || { echo "make-fixtures: sqlite3 not found on PATH" >&2; exit 1; }
@@ -97,9 +112,9 @@ sqlite3 "$OUT/real.fydb" "CREATE TABLE t(x); INSERT INTO t VALUES (1), (2);"
 #      different path through quoteIdent() than idents.db's spaces/reserved
 #      words.
 # The source file is not generated here — it is a real schema, dropped in by
-# hand at /media/VAULT/tmp/bluecoins-schema.sql. Missing input is not "skip
+# hand at $VAULT_PATH/tmp/bluecoins-schema.sql. Missing input is not "skip
 # this fixture", it is "fail the run", same as every other fixture here.
-SRC="/media/VAULT/tmp/bluecoins-schema.sql"
+SRC="$VAULT_PATH/tmp/bluecoins-schema.sql"
 rm -f "$OUT/bluecoins_schema.db"
 if [ ! -f "$SRC" ]; then
   echo "make-fixtures: FATAL — $SRC not found; bluecoins_schema fixture could not be built" >&2
@@ -171,6 +186,50 @@ wait "$HOLDER_PID" 2>/dev/null || true
 GOT=$(sqlite3 -readonly -safe -json "$OUT/wal_hotcopy.db" "SELECT COUNT(*) AS n FROM t")
 echo "$GOT" | grep -q '"n":3' \
   || { echo "make-fixtures: FATAL — wal_hotcopy.db did not read back 3 rows under -readonly -safe (got: $GOT)" >&2; exit 1; }
+
+# --- self-check: reading a WAL-journaled database THROUGH THE TOOL must -----
+# come back with real data, not a quietly wrong empty schema. Measured on the
+# real Alpine binary (sqlite-spec-272.md §1/§3): opening a database whose
+# schema and rows live entirely in an uncheckpointed -wal via `immutable=1`
+# does not error and does not warn — it just silently skips the journal's
+# content, so `sqlite_master` comes back with no tables and any query against
+# one of them fails as "no such table", indistinguishable from a typo. The raw
+# check just above proves the fixture file itself is fine under
+# `-readonly -safe`; this one instead calls sqlite.js's own query() — the
+# actual code path a tool call takes, prepareOpen() included — and would fail
+# if a future change ever let `immutable=1` reach a database with a real
+# journal again. row_count/n confirm the data came through; wal_copy=== true
+# confirms it went through the copy path rather than immutable, which is the
+# part that actually matters here.
+CHECK_JS="$OUT/.wal-copy-check.js"
+cat > "$CHECK_JS" <<'JS'
+const path = require('path');
+const S = require(path.join(process.env.SQLITE_MODULE_DIR, 'sqlite.js'));
+const dbPath = path.join(process.env.FIXTURES_DIR, 'wal_hotcopy.db');
+(async () => {
+  try {
+    const res = await S.query(dbPath, 'SELECT COUNT(*) AS n FROM t', { timeout_ms: 15000 });
+    if (res.wal_copy !== true) {
+      console.error('FATAL: wal_hotcopy.db was not read via the copy path (wal_copy=' + res.wal_copy + ') — immutable=1 may have been used against a real journal');
+      process.exit(1);
+    }
+    const n = res.rows && res.rows[0] && res.rows[0].n;
+    if (n !== 3) {
+      console.error('FATAL: expected 3 rows through the tool, got: ' + JSON.stringify(res.rows));
+      process.exit(1);
+    }
+    console.error('wal-copy check OK: row data came through (n=3), wal_copy=true');
+  } catch (e) {
+    console.error('FATAL: sqlite_query on wal_hotcopy.db raised instead of returning rows: ' + e.message);
+    process.exit(1);
+  }
+})();
+JS
+SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" node "$CHECK_JS"
+CHECK_RC=$?
+rm -f "$CHECK_JS"
+[ "$CHECK_RC" -eq 0 ] \
+  || { echo "make-fixtures: FATAL — wal-copy check failed (see above)" >&2; exit 1; }
 
 # --- self-check: hard_heap_limit actually stops a query that allocates a ---
 # lot in one place: hex(zeroblob(200000000)) forces a single ~400 MB text
