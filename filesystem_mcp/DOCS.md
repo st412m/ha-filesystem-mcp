@@ -226,6 +226,15 @@ accepts the setting and silently ignores it. So the add-on reads back the
 value SQLite reports, checks it as it arrives, and refuses to run the query at
 all if it doesn't match — `HEAP_LIMIT_UNCONFIRMED`.
 
+### Keep a few reference figures
+
+The first time you read a database, note down a row count, a distinct count,
+a total — anything cheap to recompute. Re-run the same query after updating
+the add-on or after the file gets replaced, and compare. A wrong answer from
+a database is usually a quiet one: it still looks like a normal result, so
+nothing in the output itself tells you to doubt it. The reference figures are
+what catches that — they either come back the same or they don't.
+
 ## Vault structure on a fresh install
 
 On a **first** run into an empty vault the add-on creates `raw/ha`,
