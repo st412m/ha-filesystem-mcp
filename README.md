@@ -1,86 +1,25 @@
 # Filesystem MCP Server — Home Assistant App (Add-on)
 
-Home Assistant app that exposes a local directory as an MCP (Model Context Protocol) server. Allows LLM agents like Claude to read and write files directly on your Home Assistant server.
+A Home Assistant app that exposes one directory on your Home Assistant server — a "vault" — as a [Model Context Protocol](https://modelcontextprotocol.io) server. Claude or any other MCP client can read, search and edit files there, read PDFs, and query SQLite databases read-only. It is built for a file-based knowledge base such as a Karpathy-style LLM wiki, but works for any directory tree.
 
-## What is MCP?
+Home Assistant's built-in MCP Server integration exposes entities and Assist. This app exposes files instead, and the two work side by side.
 
-[Model Context Protocol](https://modelcontextprotocol.io) is an open standard that allows AI assistants to connect to external tools and data sources. This app lets Claude (or any MCP-compatible agent) read and write files in a directory on your HA server — useful for building a personal knowledge base, wiki, or any file-based workflow.
+The transport is MCP Streamable HTTP: `POST /mcp` answered with plain `application/json`. There is one endpoint, published on port 3100.
 
-## Features
+Authorization is a secret path prefix, `/private_<token>`, because claude.ai custom connectors cannot send custom auth headers. Anyone holding the URL has full access to the vault, so treat it as a password.
 
-- Exposes a local directory (e.g. `/media/VAULT` or `/share/vault`) via MCP over HTTP (StreamableHTTP transport)
-- Multi-arch: amd64, aarch64 (Raspberry Pi 4/5)
-- Token-based auth via URL prefix (`/private_<token>/`)
-- Compatible with [claude.ai](https://claude.ai) custom connectors
-- Configurable vault path — both `/media` and `/share` are mapped read-write
-- Creates the vault skeleton and `CLAUDE.md` **once**, on a fresh install — a directory you delete afterwards stays deleted
-- **Content search** — `grep_files` finds text by regex across the tree and returns file, line number and the matching line, clipped around the match
-- **Line-addressed reading and editing** — `read_text_file` takes `offset`/`limit`, `edit_file` takes `startLine`/`endLine`, guarded by a `rev` optimistic lock
-- PDF reading support — page images (JPEG) via `read_media_file` (`#N` suffix) and `read_pdf_page`, cheap text extraction via `read_pdf_text` (pdftotext)
-- **Write policies** — mark a directory read-only, or require a file's current `rev` before anything overwrites it; a trash instead of a delete, with optional auto-purge. Off by default, configured from an ingress page in the HA sidebar
-- Optional request logging (`log_requests`) for debugging connector issues — see [Request logging](#request-logging-debugging)
+## Requirements
 
-## Community
-
-💬 [Discussion thread on Home Assistant Community Forum](https://community.home-assistant.io/t/filesystem-mcp-server-expose-your-local-directory-to-claude-karpathy-llm-wiki-for-home-assistant/)
-
-## Architecture support
-
-| Architecture | Status |
-|--------------|--------|
-| amd64 | ✅ Tested (x86-64 servers and mini PCs) |
-| aarch64 | ✅ Tested (Raspberry Pi 4, HA OS 2026.5.x — community-confirmed in [#1](https://github.com/st412m/ha-filesystem-mcp/issues/1)) |
-
-`armv7` was dropped in 2.4.1: Home Assistant Supervisor deprecated the architecture and warned on every install.
-
-## Where to put your vault
-
-The vault's location is the `vault_path` option — anywhere under `/media` or
-`/share` works. Two common choices, pick the one that fits your hardware:
-
-### Option A: External USB drive, mounted at `/media/VAULT` in this guide (recommended for dedicated storage)
-
-#### 1. Format the drive as ext4
-
-Connect your USB drive to the HA server. Open the Terminal app in HA and find the drive:
-
-```bash
-lsblk
-```
-
-Your drive will appear as `sdb`, `sdc`, or similar — the name depends on your system. Format it with ext4 and label it `VAULT`:
-
-> ⚠️ This will erase all data on the drive. Replace `sdb` with your actual device name.
-
-```bash
-mkfs.ext4 -L VAULT /dev/sdb
-```
-
-#### 2. Install the Samba NAS app for auto-mounting
-
-The [Samba NAS app](https://github.com/dianlight/hassio-addons) handles automatic mounting of the drive at every HA startup.
-
-1. Add the repository in **Settings → Apps → App Store → ⋮ → Repositories → + Add**:
-   ```
-   https://github.com/dianlight/hassio-addons
-   ```
-2. Install **Samba NAS** and start it
-
-After the app starts, your drive will be available at `/media/VAULT/` and will remount automatically on every reboot. You can verify in **Settings → System → Storage**.
-
-### Option B: Built-in `/share` storage (no USB drive needed)
-
-If the USB route is more friction than it's worth on your hardware (common on Raspberry Pi), you can keep the vault on HA's internal `/share` storage instead — no formatting, no extra apps:
-
-```yaml
-vault_path: "/share/vault"
-```
-
-The app maps both `/media` and `/share` read-write, so any path under either works. Keep in mind that `/share` lives on the same disk/SD card as HA itself — for an SD-card Pi setup, consider regular backups of the vault.
+| | |
+|---|---|
+| Home Assistant | OS or Supervised — anything that runs apps (add-ons) through Supervisor |
+| Architecture | amd64, aarch64 (Raspberry Pi 4/5) |
+| Network | port 3100/tcp; for claude.ai, a TLS reverse proxy reachable from the internet |
+| Storage | a directory under `/media` (e.g. a USB drive) or `/share` — see [docs/configuration.md](docs/configuration.md) |
 
 ## Installation
 
-> **A note on wording.** Home Assistant renamed **add-ons** to **apps** in 2026.2 (February 2026) — the UI and the docs changed, nothing else did. `config.yaml`, `repository.yaml`, the store layout and the Supervisor API still say *add-on*, which is why the repository is still named `ha-filesystem-mcp`. The click paths in this README are for 2026.2 and newer; on an older core the same two places are called *Add-ons* and *Add-on Store*.
+Home Assistant renamed *add-ons* to *apps* in 2026.2; on older versions the same menus say *Add-ons* and *Add-on Store*.
 
 **1. Add this repository**
 
@@ -88,283 +27,110 @@ The app maps both `/media` and `/share` read-write, so any path under either wor
 
 Or by hand: **Settings → Apps → App Store → ⋮ → Repositories → + Add**, paste `https://github.com/st412m/ha-filesystem-mcp`, select **Add**.
 
-*If the badge opens the App Store but no dialog appears, that is [my.home-assistant.io#698](https://github.com/home-assistant/my.home-assistant.io/issues/698), open since April 2026 — use the manual path above.*
+*If the badge opens the App Store but no dialog appears, that is [my.home-assistant.io#698](https://github.com/home-assistant/my.home-assistant.io/issues/698) — use the manual path.*
 
-**2. Install**
+**2. Install and configure**
 
-Find the **Filesystem MCP Server** card in the new repository, select **Install**, set a `token` and `vault_path` in Configuration, then **Start**.
+Find **Filesystem MCP Server** in the store and select **Install**. In **Configuration**, set `token` to a random secret — `cat /proc/sys/kernel/random/uuid` in the HA terminal gives one — and point `vault_path` at your vault.
+
+**3. Start**
+
+Select **Start**. On a fresh install the app creates a starter `CLAUDE.md`, `log.md` and a small `raw/` + `wiki/` skeleton inside the vault, once. The app log shows the toolchain versions, the vault path and the three processes starting.
 
 ## Configuration
 
-| Option | Description |
-|--------|-------------|
-| `token` | Secret token for auth. Generate with `cat /proc/sys/kernel/random/uuid` in HA terminal. Change from the default `changeme`! |
-| `vault_path` | Path to expose via MCP — anywhere under `/media` or `/share` (default: `/media/VAULT`) |
-| `log_requests` | Log every incoming request to the app log (default: `false`). See [Request logging](#request-logging-debugging) |
+| Option | Default | Description |
+|---|---|---|
+| `token` | `changeme` | Secret in the URL path. Change it before exposing the port. |
+| `vault_path` | `/media/VAULT` | The one directory the server may touch — anywhere under `/media` or `/share`. |
+| `log_requests` | `false` | Log one line per incoming request (token masked) for debugging connectors. |
 
-Example:
 ```yaml
 token: "your-uuid-here"
 vault_path: "/media/VAULT"
 log_requests: false
 ```
 
-## Request logging (debugging)
+Choosing and preparing the vault location, the first-run skeleton and request logging are covered in [docs/configuration.md](docs/configuration.md).
 
-When diagnosing connector problems — especially "claude.ai shows zero tools but curl works" — the key question is usually *did claude.ai's fetcher even reach my server?* Set `log_requests: true` in the app configuration and restart the app; the auth proxy will then log one line per incoming request:
+## Connecting to claude.ai
 
-```
-[req] 2026-07-13T10:56:25.478Z 160.79.106.34 POST /private_***/mcp -> 200 172B ua="Claude-User"
-```
-
-Fields: timestamp, client IP (`CF-Connecting-IP`, falling back to `X-Forwarded-For`, then socket address), method, path, response status, response size, User-Agent. The secret token is always masked (`/private_***`), and unauthorized (401) probes are logged too. With the default `false` the proxy logs nothing, exactly as before.
-
-Watch the log during a registration attempt: requests from Anthropic's published egress range (`160.79.104.0/21`) getting answered `200` mean the path works end to end; total silence means the requests never reached you — look upstream (tunnel, edge, or claude.ai itself). See the investigation in [#4](https://github.com/st412m/ha-filesystem-mcp/issues/4) for a worked example.
-
-## What happens on first run
-
-The app automatically creates the following structure inside your vault if it doesn't exist yet (shown at the default `vault_path`, `/media/VAULT` — yours may differ):
+The endpoint is:
 
 ```
-/media/VAULT/
-├── CLAUDE.md        # agent instructions (Karpathy wiki pattern)
-├── log.md           # operation log
-├── raw/             # drop your source files here
-│   ├── ha/
-│   └── projects/
-└── wiki/            # LLM-compiled pages
-    ├── ha/
-    │   ├── devices/
-    │   ├── automations/
-    │   └── network/
-    └── projects/
+https://<your-host>/private_<your-token>/mcp
 ```
 
-Since 2.6.0 this happens **once**, on a fresh install, and is remembered with a flag in `/data`. Delete a directory afterwards and it stays deleted. Until 2.6.0 six `mkdir -p` ran on every start, so removing `raw/projects` lasted only until the next restart — the guard was on the files, not on the directories. Upgrading an existing installation (detected by the presence of `CLAUDE.md`) never re-creates anything, and `CLAUDE.md` and `log.md` are never overwritten.
+Add it in **claude.ai → Settings → Connectors → Add custom connector**.
 
-You can drop files into `raw/` via the Samba share (`\\<your-ha-ip>\VAULT`) from Windows, or via SFTP.
+claude.ai reaches the server from the internet, so port 3100 must be published through a reverse proxy that terminates TLS — your router's own domain service, nginx, a Cloudflare Tunnel. Do not publish plain HTTP. The app itself only answers `/mcp` under the token prefix: a wrong prefix gets 401, any other path 404. A Keenetic example is in [docs/configuration.md](docs/configuration.md#exposing-the-server).
 
-> **Note on `CLAUDE.md`:** The auto-generated `CLAUDE.md` is just a starting point — a minimal template with basic instructions and vault structure. You are expected to customize it over time: add your device inventory, network topology, project context, MCP server constraints, and any rules specific to your setup. The more context you put in `CLAUDE.md`, the more useful Claude becomes across sessions. Think of it as a living document that grows with your smart home.
+## Tools
 
-## Exposing externally (required for claude.ai)
+20 tools. Parameters, return formats and the differences between similar tools are in [docs/tools.md](docs/tools.md).
 
-To connect from claude.ai you need to expose port 3100 via your router.
+**Reading**
+- `read_text_file` — a whole text file, `head`/`tail` lines, or an `offset`/`limit` range with line count and `rev`
+- `read_file` — deprecated alias of `read_text_file`
+- `read_multiple_files` — several whole files in one response
+- `read_media_file` — image or audio as base64; a PDF page as JPEG (`#N` suffix on the path)
+- `read_pdf_text` — text of a PDF or a page range, via `pdftotext -layout`
+- `read_pdf_page` — one PDF page rendered as JPEG
 
-For Keenetic routers:
-1. **Port forwarding** — **Network rules → Port forwarding → Add rule**: incoming port `3100` → your HA server IP, port `3100`
-2. **Domain** — **My networks and Wi-Fi → Domain name → Add**: name `vault-mcp`, device → your HA server, port `3100`
+**Searching**
+- `grep_files` — regex search of file contents; returns path, `rev`, line count and matching lines
+- `search_files` — find files and directories by name substring
 
-## Connecting to Claude
+**Writing**
+- `write_file` — create or overwrite a file
+- `edit_file` — literal `oldText` replacement, or line-addressed edits guarded by `rev`
+- `create_directory` — create a directory and its parents
+- `move_file` — move or rename a file or directory
+- `trash_file` — move a file into its zone's trash; there is no delete
 
-Your MCP endpoint will be:
+**Listing**
+- `list_directory` — entries of one directory
+- `list_directory_with_sizes` — entries with file sizes, sorted by name or size
+- `directory_tree` — tree view, two levels deep
+- `get_file_info` — size and times, plus line count and `rev` for text files
+- `list_allowed_directories` — the vault root
 
-```
-https://vault-mcp.yourdomain.keenetic.link/private_<your-token>/mcp
-```
+**SQLite (read-only)**
+- `sqlite_schema` — DDL of every object, file pragmas, optional per-table row counts
+- `sqlite_query` — one `SELECT`/`WITH`/`VALUES` statement, with a row limit
 
-Add this URL in **claude.ai → Settings → Connectors → Add custom connector**.
+The three listing tools print the write policy in force on every call. Policies are optional and set from the **Vault policies** page in the Home Assistant sidebar — see [docs/policies.md](docs/policies.md). The search-then-edit workflow is in [docs/search-and-edit.md](docs/search-and-edit.md), SQLite in [docs/sqlite.md](docs/sqlite.md).
 
-## Write policies
+## Limitations
 
-By default there are none and the app behaves as it always has: any tool may write anywhere in the vault. Strictness is opt-in, per directory, from the **Vault policies** page that 2.6.0 adds to the Home Assistant sidebar (ingress, admins only).
+- **Read files one at a time.** `read_multiple_files` puts every file whole into a single response with no size cap; for large files use `read_text_file` with `offset`/`limit`, or `grep_files` to find the lines first.
+- **SQLite is read-only and will stay so.** There is no write path and no flag that enables one.
+- **There is no delete.** `trash_file` moves a file into a trash directory, and only in a zone that has a trash configured.
+- **Clients cache the tool list.** After an update that changes tools, an already-open conversation keeps the old list — see Troubleshooting.
+- **Policies stop this app's tools only.** Samba, the file editor or a `shell_command` write straight to the filesystem and never see a marker.
+- `grep_files` skips binaries, symlinks, files over 20 MB and `.git` / `node_modules` / `.svn` / `.hg`; its answer is capped at 60 KB and says so when truncated.
+- `directory_tree` goes two levels deep.
 
-A policy is a JSON file named `.vault-policy` that the page writes into a directory. It applies to that directory and everything below it, until a deeper marker overrides it; fields the deeper marker does not mention keep the inherited value.
+## Troubleshooting
 
-| Mode | Effect |
-|------|--------|
-| inherits | no marker here — the rule from above applies |
-| read-only | no writes, edits, moves in or out, or discards. Reading is unaffected |
-| edits with rev | creating a new file is free; changing or moving out an **existing** file requires its current `rev` |
-| free writes | 2.5.x behaviour, no checks |
-| new files only | existing files may not be changed at all |
+- **The client shows old tools or old parameters after an update.** Refresh the connector's tool list and start a new chat. The tell for a stale schema is `write_file` without a `rev` parameter.
+- **claude.ai shows no tools, but `curl` works.** Set `log_requests: true`, restart, and watch the log during registration. If no requests arrive, look upstream at the proxy or tunnel.
+- **401 / 404 / 405 / 406.** 401 means a wrong token prefix, 404 a path other than `/mcp`, 405 a method other than `POST`, and 406 an `Accept` header without `application/json` or `text/event-stream`.
+- **Every write is refused and the listing tools print `⚠ Policy: BROKEN MARKER`.** A `.vault-policy` file is unreadable and locks its zone. Fix it from the Vault policies page first.
 
-The `rev` is the same short content hash used by `edit_file`, and it is already in hand in normal work — it comes back from `grep_files`, from `read_text_file` with `offset`, from `get_file_info`, and in the reply to the previous edit. A refusal always quotes the current one, so the retry succeeds.
-
-There is no delete. `trash_file` moves a file into its zone's trash (`.vault-trash` by default), keeping the path relative to the directory that owns the trash and stamping the arrival time into the name — `wiki/system/foo.md` becomes `wiki/.vault-trash/system/foo__trash-20260905T050121Z.md`. The stamp is there because a move does not change mtime: without it, a page that had lived in the wiki for six months would look ancient the moment it was discarded. Trash contents are excluded from `grep_files`, `search_files`, `directory_tree` and `read_multiple_files`, so a thrown-away version stops turning up in searches and being quoted as if it were current; an explicit `read_text_file` still opens it.
-
-Auto-purge is per zone and **off by default**. It removes files one at a time and empty directories with `rmdir` — there is no recursive delete anywhere in this app — and it never touches a file whose name carries no arrival stamp, on the assumption you put it there by hand. Before switching it on, check how your vault is backed up: if the backup is a mirror (`rsync --delete`, no `--backup-dir`), a purge here disappears from the backup at its next run.
-
-A corrupt marker, or one carrying an unknown field, **locks its zone**: no writes, no deletion, reading unaffected. Deliberately so — carrying on quietly under a rule nobody can read is worse than a stop you can see. The error names the file. MCP tools also refuse to create, change, move or discard anything named `.vault-policy`, `create_directory` included: a *directory* with that name would make the marker unreadable and lock the zone permanently from the tool side.
-
-**Read-only stops this app's tools and nothing else.** Anything else writing into the vault — a Home Assistant `shell_command` copying files in, Samba, the file editor — goes straight to the filesystem and never sees a marker.
-
-## Finding and editing things without reading whole files
-
-Before 2.5.0 an agent could search file *names* (`search_files`) but not file *contents*, and could read only from an edge of a file (`head`/`tail`). Finding one line in the middle of a large page meant pulling half the page into the context window. 2.5.0 closes that: `grep_files` returns addresses, and those addresses are directly usable by `read_text_file` and `edit_file`.
-
-### The loop
-
-```
-grep_files  path=/media/VAULT/wiki  pattern="blacklist-testing"  include=*.md
-  → /media/VAULT/wiki/todo.md · rev 5db20d56 · 566 lines
-      363: - [ ] Проверка черных списков (ЧС) — pet-проект …
-
-read_text_file  path=…/todo.md  offset=358  limit=15
-  → …/todo.md · rev 5db20d56 · lines 358-372 of 566
-
-edit_file  path=…/todo.md  rev=5db20d56  edits=[{startLine:363, newText:"- [x] …"}]
-  → lines 566 → 566 · rev 5db20d56 → c31af9e1
-```
-
-Every step carries the same `rev` — an 8-hex digest of the file. `edit_file` refuses a line edit whose `rev` no longer matches and writes nothing, so a stale line number can never quietly land in the wrong place. `rev` also comes back from `get_file_info`, alongside a line count.
-
-### What this costs and what it saves
-
-The tool list is sent to the model on every session, whether or not the tools are called, so new tools are a standing tax. Measured on the real `tools/list` payload:
-
-| | tools | `tools/list` bytes |
-|---|---|---|
-| 2.4.1 | 16 | 4 277 |
-| 2.5.0 | 17 | 5 630 |
-
-That is **+1 353 bytes ≈ +350 tokens per session**, and it is deliberately smaller than the raw cost of the new features: existing descriptions were compressed in the same release to pay for part of it, and line-range reading was added as two parameters on `read_text_file` rather than as a separate `read_lines` tool.
-
-Against that, one real lookup from the author's wiki — locating a single stale entry in a 185 KB / 566-line `todo.md`:
-
-| | approach | tokens pulled into context |
-|---|---|---|
-| 2.4.1 | `read_text_file head=400` (line 363 is past the middle) | ≈ 35 000 |
-| 2.5.0 | `grep_files` → 1 file, 1 line + footer | ≈ 60 |
-
-Break-even is roughly one search per hundred sessions. The defaults are set for economy rather than completeness — `max_results` 50, `context` 0, `max_line_length` 200 — because a tool that dumps everything by default costs the same as reading everything.
-
-### Behaviour worth knowing
-
-- **Long lines are clipped around the match, not from the start.** With multi-KB lines a head-clip would routinely hide the very text that matched. `max_line_length` defaults to 200 characters.
-- **Truncation is always announced.** The answer is capped at 60 KB as well as at `max_results`; when either bites, the reply carries an explicit `⚠ TRUNCATED` line. Silently returning a partial list would be worse than returning nothing.
-- **Skipped by design:** binary files (NUL byte in the first 4 KB), files over 20 MB, symlinks, and `.git` / `node_modules` / `.svn` / `.hg` directories. Counts of skipped files appear in the footer.
-- **`include` / `exclude`** are filename globs matched against the basename, with comma-separated alternatives: `include="*.md,*.yaml"`.
-- **Line edits are applied bottom-up in one atomic pass**, so several edits from a single `grep_files` result stay valid within one call. Overlapping ranges are rejected. `newText: ""` deletes the range; `newText` must not end with a newline unless a blank line is wanted. Two inserts at the same position are rejected (bottom-up they would collapse and swap), as is an insert landing inside a range replaced by the same call. `newText: ""` at an insert position is an error — there is nothing there to delete.
-- **Omitting `endLine` inserts before `startLine`; replacing requires an explicit `endLine`** (since 2.5.2). `{startLine: 50, newText: "..."}` inserts a line before line 50, and on a 12-line file `{startLine: 13, ...}` appends at EOF — appending is the same insert landing at the end, not a special case. Appending to an empty file is `startLine: 1`. `rev` is required exactly as for any other line edit; `startLine` beyond `lines`+1 and an explicit `endLine` past the last line are both errors, each naming the form you probably wanted. In 2.5.1 a missing `endLine` silently meant *replace line `startLine`* anywhere except EOF, so an append aimed one line short overwrote a line instead of adding one.
-- **`head` / `tail` count the same lines as everything else** (since 2.5.1). Before that, `tail=N` on a file ending with a newline returned N−1 lines.
-- **CRLF, BOM and a missing final newline are preserved** by line edits.
-- `oldText`/`newText` edits are unchanged and still work without `rev`.
-
-### ⚠️ After updating: start a new chat
-
-MCP clients cache `tools/list` for the lifetime of a conversation, so a chat that was already open keeps the tool list it started with. On 2.5.0 that meant `grep_files` appeared only in a **new** conversation; on 2.5.1 and 2.5.2, where no tools were added, only the *description* of `edit_file` changed — the behaviour itself is not cached, so an already-open chat gets the new semantics while still reading the old description.
-
-A new conversation is not always enough on its own, either: some clients cache
-`tools/list` per *client session*, not per conversation, so a new chat opened
-right after the add-on restarts can still be served the old list without ever
-re-fetching it — new tools then simply don't appear, which looks like the
-update never shipped. If that happens, reset the client session itself (fully
-sign out/in, or re-register the connector), not just the conversation. With
-`log_requests: true` you can tell the two apart: the `tools/list` response is
-around 7 KB and nothing else this server sends is that size, so its presence
-or absence in the log right after a restart says whether the client actually
-asked for the new list.
-
-## SQLite (read-only)
-
-A SQLite database inside the vault can be inspected and queried. Nothing writes.
-
-`sqlite_schema(path, counts?, counts_timeout_ms?)` returns every object in the
-file with its original DDL, plus `journal_mode`, `page_size`, `page_count`,
-`encoding`, `user_version` and `application_id`, the file's size and mtime
-(UTC and local with a numeric offset, e.g. `+03:00`), and whether a `-wal` or
-`-shm` sits beside the **original** file — reading it through this tool never
-adds one. A database with a real `-wal` journal is read from a private,
-automatically-removed copy instead of in place; `wal_copy` and `wal_copy_ms`
-in the response say whether that happened for this call and how long it took.
-
-Row counts are off by default, because `COUNT(*)` is a full table scan. With
-`counts: true` every table gets its own `counts_timeout_ms` budget (default
-60000). A table that overruns comes back as `null` and is listed in
-`counts_incomplete`, and the rest of the schema is returned normally. The budget
-covers spawning `sqlite3` and opening the file as well as the count, so a very
-small budget fails every table however tiny. Row count is a weak predictor of
-how long a count takes — available indexes matter more.
-
-`sqlite_query(path, sql, limit?, timeout_ms?)` runs a single statement and
-returns rows. Ask for `limit` rows and you are told explicitly when there were
-more. `timeout_ms` kills a runaway query, and an oversized result is an error
-rather than a silent partial answer. Same `wal_copy`/`wal_copy_ms` reporting
-as `sqlite_schema`.
-
-### What is refused, and why
-
-Queries run through `sqlite3` in read-only safe mode. Safe mode is not only
-about writes: it blocks `ATTACH`, which would otherwise let a query read any
-file on the host and bypass the vault's zone policy entirely. Dot commands,
-`writefile()`, `edit()` and extension loading go with it.
-
-Statements are checked before they run, and each refusal names the rule it hit:
-a leading dot, more than one statement, or a statement that is not `SELECT`,
-`WITH`, `VALUES` or `EXPLAIN`. The multi-statement check is a plain search for
-`;`, so a query with a semicolon inside a string literal is refused as well.
-That is a known limitation; it fails loudly instead of guessing.
-
-File type comes from the first sixteen bytes, not the extension. A database
-named `.fydb` is read; a text file named `.db` is refused with its header
-quoted back.
-
-### Two things worth knowing
-
-BLOB columns come back untouched and will be unreadable inside JSON. Wrap them:
-`hex(col)` or `length(col)`.
-
-A database with an uncheckpointed `-wal` beside it is read from a private,
-automatically-removed copy rather than in place, so nothing is left next to
-the original — no new `-shm`, no new `-wal`. `WAL_PRESENT_READONLY` no longer
-means a read-only mount; it now means preparing that copy itself failed (no
-space, unreadable source, unwritable temp directory).
-
-## Recommended companion apps
-
-For the full Karpathy LLM wiki experience, also install:
-
-- **[HA-MCP](https://github.com/homeassistant-ai/ha-mcp)** — gives Claude access to your Home Assistant entities, automations, and devices. Together with Filesystem MCP, Claude can read your HA state and write structured wiki pages about it.
-- **Keenetic MCP** — if you use a Keenetic router, gives Claude access to network clients, DHCP, Wi-Fi, and VPN status.
+Details are in [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Security
 
-- The token is embedded in the URL path — this is intentional, as claude.ai does not support custom auth headers for MCP connectors
-- Never expose port 3100 to the internet without HTTPS
-- Change the default token `changeme` before exposing externally
-- Use a randomly generated UUID as your token
-- Every path is confined to `vault_path`. Since 2.5.0 this also covers symlinks pointing out of the vault and sibling directories that merely share the name prefix (`/media/VAULT_backup` no longer passes for `/media/VAULT`)
-- `grep_files` runs in a short-lived child process with a 10-second hard kill, so a catastrophically backtracking regex cannot wedge the server
-- Since 2.6.0 the auth proxy forwards **only** `/mcp`; every other path answers 404 before reaching the server. Until then it cut the token prefix off and passed whatever was left through, so every route the server had was published — which is how `POST /write`, an unauthenticated whole-file overwrite, was reachable from the internet
-- The policy page runs as a separate process on a separate internal port and is reachable only through Home Assistant ingress, which authenticates the user itself. It is not reachable through the token URL, and the MCP dispatcher holds no reference to the function that writes markers
+- The path prefix is the password. Use a random UUID, never the default `changeme`, and put TLS in front of port 3100.
+- Every path is confined to `vault_path`: a path outside it, a symlink pointing out of it, or a sibling directory sharing its name prefix is refused, and nothing is read or written.
+- The auth proxy forwards only `/mcp`. Every other path answers 404 before it reaches the server.
+- The Vault policies page is a separate process on internal port 3101, reachable only through Home Assistant ingress. It accepts connections from the Supervisor address `172.30.32.2` only and cannot be reached through the token URL.
+- `grep_files` runs in a child process that is killed after 10 seconds, so a runaway regex cannot hang the server.
+- SQLite runs as `sqlite3 -readonly -safe`: `ATTACH` and the other ways out of the vault through SQL are disabled.
 
-## Architecture
+## Links
 
-```
-Claude (claude.ai)
-    ↓ HTTPS
-Reverse proxy (Keenetic / nginx / Cloudflare Tunnel)
-    ↓ HTTP :3100
-proxy.js (token auth, /mcp only, optional request logging)
-    ↓ HTTP :3099
-server.js (MCP StreamableHTTP)
-    ↓
-vault_path (your files — /media/VAULT by default)
-    ↑
-policy-ui.js (:3101, ingress only, writes .vault-policy)
-    ↑ HTTP, 172.30.32.2 only
-Home Assistant sidebar → "Vault policies"
-```
-
-## Changelog
-
-- **2.7.2** — WAL-mode databases no longer leave side files behind: one with no `-wal` (or an empty leftover one) is opened in place via sqlite3's `immutable=1` URI mode, and one with a real `-wal` is read from a private, automatically-removed copy made once per tool call rather than once per `sqlite3` spawn — a `counts: true` call no longer copies a large database once per table. Both SQLite tools report `wal_copy`/`wal_copy_ms`, whether a copy was made for that call and how long it took. `WAL_PRESENT_READONLY` now means preparing that copy itself failed, not a read-only mount. **Breaking:** `mtime_msk`, which hardcoded a fixed MSK+3 offset, is removed; replaced by `mtime_local` — the container's own local time with an explicit numeric offset (e.g. `+03:00`) instead of a letter abbreviation
-- **2.7.1** — every `sqlite3` call now runs under a fixed 256 MiB working-memory limit, confirmed by reading back SQLite's own echo of it rather than assumed: a query that allocates too much in one place (a large sort, `group_concat()`, `hex()` on a big BLOB) is stopped and reported as `QUERY_TOO_LARGE`, and `HEAP_LIMIT_UNCONFIRMED` refuses to run at all on a build that silently doesn't enforce the limit; the same check runs again at image build time. Minor: `sqlite_schema` now reports `elapsed_ms` like `sqlite_query` already did; `NOT_SQLITE` shows the first sixteen bytes as ASCII alongside hex when they're printable; the incomplete-count note is shorter and no longer restates the tool description
-- **2.7.0** — read-only SQLite. New `sqlite_schema` (every table/index/view/trigger's DDL, the file's pragmas and sqlite3 version, whether `-wal`/`-shm` sit beside it, optional per-table `COUNT(*)` with its own timeout budget) and `sqlite_query` (one `SELECT`/`WITH`/`VALUES`/`EXPLAIN` statement, wrapped for a hard row limit and truncation detection). `-safe` disables `ATTACH`, `.shell`, `.open`, `load_extension()` and the rest, so a query cannot escape the vault's own path check through SQL. Nothing writes, and nothing is planned to — there is no flag that turns this into a write path
-- **2.6.0** — write policies. A `.vault-policy` marker makes a directory and everything below it read-only, or requires a file's current `rev` before an existing file is overwritten or moved out, or allows only new files; markers are written solely from a new ingress page in the HA sidebar, and the MCP tools refuse to create, change, move or discard one (`create_directory` included — a *directory* of that name would lock the zone with no way to repair it from the tool side). New `trash_file` replaces deletion: the file moves into its zone's trash keeping its relative path, with the arrival time stamped into the name, and trash contents drop out of `grep_files`, `search_files`, `directory_tree` and `read_multiple_files`. Optional per-zone auto-purge, **off by default**, removes files one at a time, never recursively, and never touches a file without an arrival stamp. `write_file` and `move_file` accept `rev`; every refusal quotes the current one. The three listing tools now print the rule in force and where it comes from on every call. A corrupt or unknown-field marker fails **closed** — no writes, no deletion, reading unaffected. **Removed: `POST /write`** — an unauthenticated whole-file overwrite that the blind prefix proxy published to the internet, making any policy below it bypassable with one `curl`; there is no replacement, and any `rest_command` using it must be removed. The proxy now forwards only `/mcp`. **Changed:** the vault skeleton is created once on a fresh install instead of on every start, so a deleted directory no longer comes back. **Not breaking:** a vault with no markers behaves exactly as in 2.5.2, and `read_text_file` without a range still returns the bare file contents byte for byte
-- **2.5.2** — one behaviour fix, no new tools and no schema changes. **Omitting `endLine` now inserts before `startLine` instead of silently replacing that line.** 2.5.1 made `{startLine: lines+1}` with no `endLine` an append at EOF, but at any other line the same shape still meant *replace line `startLine`*, because `endLine` defaulted to `startLine` — one shape with two meanings, selected by a number the caller had to compute correctly first. An append aimed one line short did not fail; it quietly overwrote a line, which is the exact silent corruption line addressing exists to prevent. Found during acceptance testing of 2.5.1. Appending is now the same insert landing at the end rather than a special case, and inserting into the middle of a file — previously impossible, and worked around with `oldText` against a hand-copied line — is a normal call. Replacing requires an explicit `endLine`. New refusals: `startLine` beyond `lines`+1 (naming the last valid insert position), two inserts at the same position in one call, and an insert falling inside a range replaced by the same call. `rev` remains mandatory, `newText: ""` at an insert position is an error, CRLF/BOM/missing final newline are preserved, and `oldText` edits are untouched. **Breaking:** `{startLine: N, newText: "..."}` with no `endLine` used to replace line N and now inserts before it; the shorthand was undocumented and shipped only in 2.5.1. `tools/list` 5,682 → 5,741 bytes
-- **2.5.1** — two fixes from acceptance testing of 2.5.0, no new tools and no schema changes. **`tail=N` returned N−1 lines** on any file ending with a newline — that is, on almost every file: the `head`/`tail` branch sliced a raw `split('\n')`, in which a trailing newline leaves a phantom empty element at the end. It now slices the same line array as `offset`/`limit` and `get_file_info`, so `tail=N` and a `lines` count of N agree. The bug predates 2.5.0; the `lines` field added in 2.5.0 is simply what made it visible. `head` was never affected and its output is unchanged. **Appending by line number is now possible:** `{startLine: lines+1}` with no `endLine` inserts at the end of the file instead of failing with *endLine is past the end of the file*. It is an empty range at EOF, not a new parameter — an explicit `endLine` past the end is still refused (with a hint), `rev` is still mandatory, `newText: ""` at the append position is an error rather than a silent no-op, and two appends in one call are refused instead of being silently reordered by the bottom-up pass. CRLF, BOM and a missing final newline are preserved as before
-- **2.5.0** — content search and line-addressed editing. New `grep_files` (regex, recursive, `include`/`exclude` globs, `context`, `max_results`, `max_line_length` — long lines are clipped *around* the match; binaries, symlinks and `.git`/`node_modules` skipped; output capped at 60 KB with an explicit truncation warning; runs in a forked child with a 10 s hard kill so a catastrophically backtracking regex cannot hang the server). `read_text_file` gains `offset`/`limit` for arbitrary line ranges; `edit_file` gains `{startLine,endLine,newText}` edits protected by a `rev` optimistic lock and applied bottom-up in one atomic pass; `get_file_info` now reports `lines` and `rev` for text files. Path confinement hardened: symlinks escaping the vault are refused, and a sibling directory sharing the name prefix no longer passes the check. Existing tool descriptions were compressed to offset part of the added `tools/list` payload. No option, port or storage-format changes; all existing tool signatures and outputs are unchanged
-- **2.4.1** — dropped `armv7`: Home Assistant Supervisor deprecated the architecture and printed a warning on every install. No functional change on amd64/aarch64 — the whole diff is the `arch` list in `config.yaml`, the `io.hass.arch` label in the Dockerfile, and the architecture table above
-- **2.4.0** — migrate off deprecated `build.yaml`: base image is now set in the Dockerfile as the arch-less multi-arch manifest `ghcr.io/home-assistant/base:3.22` (buildx resolves the platform — no silent wrong-arch fallback); toolchain moves to Alpine 3.22 (nodejs 20→22, poppler 24→25), guarded by a build-time major-version check plus a smoke test of the real PDF pipeline (`pdfinfo`/`pdftoppm`/`pdftotext` on a generated reference PDF); toolchain versions and build manifest are printed to the addon log on start; addon version now flows from `config.yaml` → `BUILD_VERSION` → `ADDON_VERSION` (no more hardcoded versions in `server.js`/`run.sh`); dropped unused `npm` from the image
-- **2.3.2** — new `log_requests` option: opt-in request logging in the auth proxy (client IP, method, token-masked path, status, response size, User-Agent; 401 probes included) for debugging connector issues ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)); no behavior changes with default settings
-- **2.3.1** — GET `/mcp` now returns `405 Method Not Allowed` per the MCP Streamable HTTP spec instead of holding a dead SSE stream open (hung clients ~30s even on LAN, broke tool registration through buffering proxies like Cloudflare Tunnel); POST `/mcp` responds with plain `application/json` instead of a single-event SSE — immune to tunnel SSE buffering that could truncate large base64 payloads ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4))
-- **2.3.0** — new `read_pdf_text` tool (pdftotext with layout preservation, optional page range); removed non-spec `structuredContent` duplication from all tool responses — roughly halves the payload for media results ([#3](https://github.com/st412m/ha-filesystem-mcp/issues/3)); `read_media_file` now actually returns the total PDF page count as documented; removed dead SVG rendering path (`read_pdf_page` always returned JPEG since 2.0.0)
-- **2.2.2** — fix `TypeError` when MCP clients (claude.ai) serialize array parameters as JSON strings — affected `edit_file`, `read_multiple_files`, `search_files` ([#2](https://github.com/st412m/ha-filesystem-mcp/issues/2))
-- **2.2.1** — multi-arch support (amd64/aarch64/armv7) via `build.yaml`; `share:rw` mapping so `vault_path` can live under `/share`; fixes build failure on Supervisor 2026.04+ ([#1](https://github.com/st412m/ha-filesystem-mcp/issues/1))
-- **2.1.0** — `POST /write` endpoint for HA automations *(removed in 2.6.0)*
-- **2.0.0** — custom HTTP MCP server (StreamableHTTP), supergateway removed; PDF page reading
-
-## License
-
-MIT
+- [docs/](docs/) — [tools](docs/tools.md), [configuration](docs/configuration.md), [write policies](docs/policies.md), [sqlite](docs/sqlite.md), [search and editing](docs/search-and-edit.md), [troubleshooting](docs/troubleshooting.md), [internals](docs/internals.md)
+- [Changelog](filesystem_mcp/CHANGELOG.md)
+- [License](LICENSE) — MIT

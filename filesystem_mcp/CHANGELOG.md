@@ -1,185 +1,202 @@
 # Changelog
 
-## 2.7.2
+## 2.7.3 — 2026-09-22
 
-**WAL databases no longer leave side files behind.** Reading a database with
-no `-wal` journal (or an empty leftover one) now opens it in place via
-sqlite3's `immutable=1` URI mode — no `-shm`/`-wal` sibling is created. A
-database with a real `-wal` is instead read from a private, automatically
-removed copy made once per tool call (not once per `sqlite3` spawn — a
-`counts: true` call on a database with a dozen tables no longer copies the
-file a dozen times over). Matters most for a vault synced by Syncthing or
-similar, where every leftover side file used to propagate to every device.
-`immutable=1` is deliberately never used when a journal is present: measured
-against a real hot-copied WAL database, it doesn't error or warn, it just
-silently reads past the journal's content — an empty schema and "no such
-table" instead of the real data.
+Documentation split into a README and a `docs/` directory; build-time messages are now in English. Server behaviour is unchanged.
+
+### Added
+- `LICENSE` (MIT) at the repository root.
+
+### Changed
+- `README.md` is now a short landing page: requirements, installation, configuration, connecting, tools, limitations, troubleshooting, security.
+- Detailed reference moved to `docs/`: tools, configuration, write policies, SQLite, search and editing, troubleshooting, internals.
+- `DOCS.md` (the add-on's Documentation tab) is now an operator guide with absolute links into `docs/`.
+- Version history moved from the README into this file, with release dates taken from the git tags.
+- Toolchain guard and smoke-test messages in `toolchain-check.sh` are now in English.
+
+## 2.7.2 — 2026-09-13
+
+WAL-mode databases are read without leaving side files next to the original.
+
+### Added
+- `wal_copy` and `wal_copy_ms` in `sqlite_schema` and `sqlite_query` responses: whether the call read from a private copy and how long the copy took.
+
+### Changed
+- A database with no `-wal`, or an empty one, is opened in place through `immutable=1`, so no `-shm` or `-wal` appears beside it.
+- A database with a non-empty `-wal` is read from a private copy made once per tool call and removed afterwards.
+- `WAL_PRESENT_READONLY` now means preparing that copy failed (no space, unreadable source, unwritable temp directory), not a read-only mount.
+- `test/make-fixtures.sh` runs under plain `sh`, requires `VAULT_PATH`, and writes to `$VAULT_PATH/tmp/fixtures` by default.
 
 ### Breaking
+- `mtime_msk` removed; `mtime_local` replaces it, giving the container's local time with a numeric offset such as `+03:00`.
 
-- **`mtime_msk` is gone.** It hardcoded a fixed MSK+3 offset, which is
-  wrong for anyone else running this add-on. Replaced by `mtime_local`: the
-  container's own local time with an explicit numeric offset (e.g.
-  `2026-09-13 07:31:02 +03:00`), no letter abbreviation, in both
-  `sqlite_schema` and `sqlite_query`.
+## 2.7.1 — 2026-09-12
 
-### Added
-
-- `wal_copy` (boolean) and `wal_copy_ms` (number or `null`) in both
-  `sqlite_schema` and `sqlite_query` responses — whether that call read from
-  a private WAL copy, and how long making it took.
-
-### Changed
-
-- `WAL_PRESENT_READONLY` no longer means "checkpoint the source" — under the
-  new copy-once-per-call scheme the copy's directory is always writable, so
-  the old failure (sqlite3 refusing to create `-shm` on a read-only mount)
-  can't reach this code path anymore. It now fires only if preparing the
-  working copy itself fails (no space, unreadable source, unwritable temp
-  dir), and says so.
-- `test/make-fixtures.sh` converted from bash to plain `sh` — the add-on
-  image has no bash. It now requires `VAULT_PATH` in the environment instead
-  of defaulting to a fixed `/media/VAULT`, and defaults its output
-  directory to `$VAULT_PATH/tmp/fixtures` instead of a path under the repo.
-  Added a regression check that reads the WAL-hotcopy fixture through
-  `sqlite.js` itself and asserts the row data comes back with `wal_copy: true`
-  — the cheapest way to catch a future accidental use of `immutable=1`
-  against a database that actually has a journal.
-
-## 2.7.1
-
-**A memory ceiling on SQLite queries.** Every `sqlite3` call now runs under a fixed working-memory limit of 256 MiB. A query that tries to allocate more than that is stopped and reported as `QUERY_TOO_LARGE`, which is a different failure from running out of time (`QUERY_TIMEOUT`) or returning too much (`OUTPUT_TOO_LARGE`). The queries this catches are the ones that allocate heavily in one place: a large sort, `group_concat()` over many rows, `hex()` on a large BLOB.
-
-The limit is verified rather than assumed. SQLite's memory limiter is only active in builds that track allocations, and a build where it is compiled out accepts the setting and silently ignores it. So the add-on reads back the value SQLite reports, checks it as it arrives, and refuses to run the query at all if it doesn't match — `HEAP_LIMIT_UNCONFIRMED`. The same check runs at image build time, next to the existing `ATTACH` smoke test, so a future base image that drops the limiter fails the build instead of quietly losing the ceiling.
-
-### Changed
-
-- `sqlite_schema` now reports `elapsed_ms`, as `sqlite_query` already did. With `counts: true` the time taken is the main thing worth knowing.
-- `NOT_SQLITE` prints the first sixteen bytes as ASCII alongside the hex when they are printable. `74686973...` is `this is not a sq`, and nobody reads that off the hex.
-- The note on an incomplete count is down from 236 characters to under 100. It no longer restates what the timeout means — that belongs in the tool description, which a caller reads before calling.
-- The `sqlite_schema` description now says to call it without `counts` first and only then with `counts` if needed. The DDL comes back in full either way, so on a database with many tables the second call repeats what you already have.
-- Text files in the repository are now pinned to LF via `.gitattributes`, so a checkout on Windows with `core.autocrlf=true` no longer rewrites the shell scripts with CRLF endings.
-- The PDF smoke test no longer prints poppler's missing-font warning. The exit code, the output file and its header are still checked, so a real failure is not lost in the quiet.
-
-Nothing about reading, policies, trash, `rev`, the ingress page or the options schema has changed.
-
-## 2.7.0
-
-**Read-only SQLite.** A `.db` file in the vault can now be inspected and
-queried. Two tools: `sqlite_schema` returns the DDL of everything in the file
-plus the pragmas that describe it, and `sqlite_query` runs a single `SELECT`
-and returns rows. Nothing writes. There is no hidden flag that makes them
-write, and no second stage planned — a database reached over a sync folder is
-not a safe thing to modify, and a tool that can corrupt a backup is worse than
-no tool.
+A fixed 256 MiB working-memory limit on every `sqlite3` call.
 
 ### Added
-
-- `sqlite_schema` — objects with their original DDL, `journal_mode`,
-  `page_size`, `page_count`, `encoding`, `user_version`, `application_id`, the
-  file's size and mtime in UTC and MSK, and whether `-wal` and `-shm` sit
-  alongside. Row counts are **off by default**: `COUNT(*)` is a full scan.
-  With `counts: true` each table gets its own `counts_timeout_ms` budget
-  (default 60000). A table that runs out returns `null` and is named in
-  `counts_incomplete`; the rest of the schema still comes back. The budget
-  covers spawning `sqlite3` and opening the database, not just the count
-  itself, so a very small budget fails every table regardless of its size.
-  Row count predicts count time poorly — which indexes exist matters more.
-- `sqlite_query` — one statement, wrapped so that overflow is detectable:
-  ask for `limit` rows and you are told plainly when there were more.
-  `timeout_ms` kills a runaway query. Output is capped; a result too large to
-  return is an error, never a silent partial answer.
-
-### How it refuses
-
-Both tools go through the `sqlite3` binary in read-only safe mode. Safe mode
-matters for more than writes: it blocks `ATTACH`, which would otherwise let a
-query read any file on the host and walk straight around the zone policy. Dot
-commands, `writefile()`, `edit()` and extension loading are refused with it.
-
-Statements are checked before they run and each refusal says which rule was
-hit: a dot command, more than one statement, or something that isn't a
-`SELECT`, `WITH`, `VALUES` or `EXPLAIN`. The multi-statement check is a plain
-search for `;`, so a query carrying a semicolon inside a string literal is
-refused too. That is a real limitation and it fails loudly rather than being
-parsed heuristically.
-
-A file is identified by its first sixteen bytes, not by its extension. A
-SQLite database named `.fydb` works; a text file named `.db` is rejected with
-its header quoted back.
-
-### Notes
-
-- BLOB columns are returned as-is and will be unreadable in JSON. Wrap them:
-  `hex(col)` or `length(col)`.
-- An uncheckpointed database with a `-wal` beside it reads fine as long as the
-  containing directory is writable, because SQLite creates the `-shm` index
-  itself; reading one leaves that `-shm` behind. Where the directory denies
-  writes — a read-only mount, a share without write permission — the open
-  fails and `WAL_PRESENT_READONLY` explains why instead of passing SQLite's
-  "attempt to write a readonly database" through unhelpfully.
-- No new npm dependencies. The image gains the `sqlite` package; the toolchain
-  check guards its major version at build time and verifies that safe mode
-  really does refuse `ATTACH`.
-
-Everything else is unchanged from 2.6.0.
-
-## 2.6.0
-
-**Write policies.** A directory can now be marked read-only, or made to require
-a file's current `rev` before anything overwrites it, and can be given a trash
-instead of a delete. The rule applies to that directory and everything below it
-until a deeper marker overrides it. **Nothing is switched on by an update**: a
-vault with no markers behaves exactly as it did in 2.5.2. Turn strictness on
-where you want it from the new **Vault policies** page — the add-on now appears
-in the Home Assistant sidebar (admins only). Full documentation is on the
-add-on's Documentation tab.
-
-### Removed
-
-- **`POST /write` is gone.** It wrote any file in the vault with no version
-  check and no token of its own, and the auth proxy forwarded it straight from
-  the internet, so any policy below it could be bypassed with one `curl`. If you
-  used it from a `rest_command`, remove that command — there is no replacement;
-  write through the MCP tools.
-- The auth proxy no longer blind-forwards. Only `/mcp` is passed through;
-  everything else answers 404 before reaching the server.
-
-### Added
-
-- `.vault-policy` markers: `readonly`, `overwrite` (`rev` / `never` / `free`),
-  `trash`, `retention_enabled`, `retention_days`.
-- **Vault policies** page over ingress: one level of the tree, a mode per
-  directory, trash and auto-purge toggles. The only thing that writes markers.
-  MCP tools refuse to create, change, move or discard a `.vault-policy` — a
-  directory of that name would lock a zone with no way to repair it from the
-  tool side.
-- `trash_file` — the only way to remove something. The file moves into its
-  zone's trash keeping its relative path, with the arrival time stamped into
-  the name. Trash contents are excluded from `grep_files`, `search_files`,
-  `directory_tree` and `read_multiple_files`, so discarded pages stop turning up
-  in searches; they are still readable by explicit path.
-- Optional auto-purge of the trash, **off by default**, per zone. It removes
-  files one by one — no recursive delete anywhere — and never touches a file
-  whose name has no arrival stamp, i.e. anything you dropped in over Samba.
-- `write_file` and `move_file` accept `rev`. In an `overwrite: "rev"` zone,
-  overwriting an existing file or moving one out of the zone requires it;
-  creating a new file does not. Every refusal quotes the current `rev`, so the
-  second attempt succeeds.
-- `list_directory`, `list_directory_with_sizes` and `directory_tree` now print
-  the rule in force and where it comes from, on every call.
+- `QUERY_TOO_LARGE`: a query that exceeds the memory limit is stopped and reported as such.
+- `HEAP_LIMIT_UNCONFIRMED`: the query is refused when the `sqlite3` build does not confirm the limit; the same check runs at image build time.
+- `elapsed_ms` in `sqlite_schema` responses.
 
 ### Changed
+- `NOT_SQLITE` shows the first sixteen bytes as ASCII next to the hex when they are printable.
+- The `counts_incomplete` note is shorter.
+- The `sqlite_schema` description advises calling without `counts` first.
+- Text files are pinned to LF by `.gitattributes`.
+- The PDF smoke test no longer prints poppler's missing-font warning.
 
-- **A deleted directory is no longer recreated on restart.** Until now six
-  `mkdir -p` ran on every start, so removing `raw/projects` lasted until the
-  next restart. The skeleton is created once, on a fresh install, and remembered
-  with a flag in `/data`. Existing installations are detected by the presence of
-  `CLAUDE.md` and are never re-seeded.
-- A corrupt marker, or one with an unknown field, locks its zone: no writes, no
-  deletion, reading unaffected. This is deliberate — running quietly under a
-  rule nobody can read is worse than stopping. The error names the file and how
-  to fix it.
+## 2.7.0 — 2026-09-12
 
-Reading is unchanged. `read_text_file` without a range still returns the bare
-file contents, byte for byte as in 2.5.2.
+Read-only SQLite.
+
+### Added
+- `sqlite_schema`: DDL of every table, index, view and trigger, file pragmas, `sqlite3` version, presence of `-wal`/`-shm`, and optional per-table `COUNT(*)` with its own timeout budget.
+- `sqlite_query`: one `SELECT`/`WITH`/`VALUES`/`EXPLAIN` statement with a row limit, truncation flag and timeout.
+- Queries run under `sqlite3 -readonly -safe`, which disables `ATTACH`, dot commands, `writefile()`, `edit()` and extension loading.
+- The image gains the `sqlite` package; the toolchain check guards its major version and verifies that `-safe` refuses `ATTACH`.
+
+## 2.6.0 — 2026-09-05
+
+Write policies, a trash instead of deletion, and an allow-list in the auth proxy.
+
+### Added
+- `.vault-policy` markers with the fields `readonly`, `overwrite` (`rev` / `never` / `free`), `trash`, `retention_enabled`, `retention_days`.
+- **Vault policies** ingress page in the Home Assistant sidebar, the only thing that writes markers.
+- `trash_file`: moves a file into its zone's trash with an arrival timestamp in the name.
+- Optional per-zone auto-purge of the trash, off by default.
+- `rev` parameter on `write_file` and `move_file`.
+- `list_directory`, `list_directory_with_sizes` and `directory_tree` print the policy in force on every call.
+
+### Changed
+- Trash contents are excluded from `grep_files`, `search_files`, `directory_tree` and `read_multiple_files`.
+- MCP tools refuse to create, change, move or discard anything named `.vault-policy`.
+- A corrupt marker, or one with an unknown field, locks its zone against writes and deletion.
+- The vault skeleton is created once, on a fresh install, instead of on every start.
+
+### Breaking
+- `POST /write` removed, with no replacement; the auth proxy now forwards only `/mcp`.
+
+## 2.5.2 — 2026-08-18
+
+Line edits without `endLine` insert instead of replacing.
+
+### Added
+- Refusals for `startLine` beyond `lines`+1, two inserts at one position, and an insert inside a range replaced by the same call.
+
+### Breaking
+- `{startLine: N, newText}` without `endLine` inserts before line N; replacing requires an explicit `endLine`.
+
+## 2.5.1 — 2026-08-17
+
+Two line-handling fixes.
+
+### Changed
+- `{startLine: lines+1}` without `endLine` appends at the end of the file.
+
+### Fixed
+- `tail=N` returned N−1 lines on files ending with a newline.
+
+## 2.5.0 — 2026-08-16
+
+Content search and line-addressed editing.
+
+### Added
+- `grep_files`: recursive regex search with `include`/`exclude` globs, `context`, `max_results` and `max_line_length`, run in a child process with a 10 s kill.
+- `offset`/`limit` on `read_text_file`.
+- `{startLine, endLine, newText}` edits in `edit_file`, guarded by `rev`.
+- `lines` and `rev` in `get_file_info` for text files.
+
+### Changed
+- Existing tool descriptions shortened.
+
+### Fixed
+- Symlinks pointing out of the vault are refused.
+- A sibling directory sharing the vault's name prefix no longer passes the path check.
+
+## 2.4.1 — 2026-07-21
+
+Supported architectures reduced to amd64 and aarch64.
+
+### Breaking
+- `armv7` dropped; supported architectures are amd64 and aarch64.
+
+## 2.4.0 — 2026-07-21
+
+Base image and toolchain moved to Alpine 3.22.
+
+### Added
+- Build-time toolchain guard and PDF smoke test (`toolchain-check.sh`).
+- Toolchain versions and build manifest printed to the add-on log on start.
+
+### Changed
+- Base image set in the Dockerfile as `ghcr.io/home-assistant/base:3.22`; `build.yaml` removed.
+- nodejs 20 → 22, poppler 24 → 25.
+- Add-on version flows from `config.yaml` through `BUILD_VERSION` to `ADDON_VERSION`.
+- `npm` removed from the image.
+
+## 2.3.2 — 2026-07-13
+
+Optional request logging for debugging connector issues.
+
+### Added
+- `log_requests` option: one log line per request in the auth proxy, token masked ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)).
+
+## 2.3.1 — 2026-07-12
+
+Transport aligned with the MCP Streamable HTTP spec.
+
+### Changed
+- `POST /mcp` responds with `application/json` instead of a single-event SSE stream ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)).
+
+### Fixed
+- `GET /mcp` returns `405 Method Not Allowed` instead of holding an idle SSE stream open ([#4](https://github.com/st412m/ha-filesystem-mcp/issues/4)).
+
+## 2.3.0 — 2026-07-10
+
+PDF text extraction and smaller tool responses.
+
+### Added
+- `read_pdf_text`: pdftotext with layout preservation and an optional page range.
+
+### Changed
+- `structuredContent` removed from tool responses ([#3](https://github.com/st412m/ha-filesystem-mcp/issues/3)).
+- Unused SVG rendering path removed.
+
+### Fixed
+- `read_media_file` returns the total PDF page count.
+
+## 2.2.2 — 2026-07-08
+
+Array parameters sent as JSON strings are accepted.
+
+### Fixed
+- `TypeError` when a client sends array parameters as JSON strings, in `edit_file`, `read_multiple_files` and `search_files` ([#2](https://github.com/st412m/ha-filesystem-mcp/issues/2)).
+
+## 2.2.1 — 2026-06-12
+
+Multi-arch builds and `/share` support.
+
+### Added
+- Multi-arch builds (amd64, aarch64, armv7) via `build.yaml`.
+- `share:rw` mapping, so `vault_path` can live under `/share`.
+
+### Fixed
+- Build failure on Supervisor 2026.04 and newer ([#1](https://github.com/st412m/ha-filesystem-mcp/issues/1)).
+
+## 2.1.0 — 2026-04-25
+
+HTTP write endpoint for automations.
+
+### Added
+- `POST /write` endpoint for Home Assistant automations (removed in 2.6.0).
+
+## 2.0.0 — 2026-04-25
+
+Custom HTTP MCP server replaces supergateway.
+
+### Added
+- Streamable HTTP transport.
+- PDF page reading.
+
+Releases before 2.0.0 predate this changelog and are not documented.

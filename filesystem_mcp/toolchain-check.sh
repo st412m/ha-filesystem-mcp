@@ -33,19 +33,19 @@ major() { echo "$1" | sed 's/[.-].*//'; }
 guard() {
   rc=0
   if [ "$(major "$NODE_V")" != "$EXPECT_NODE_MAJOR" ]; then
-    echo "TOOLCHAIN GUARD: nodejs $NODE_V, ожидался мажор $EXPECT_NODE_MAJOR" >&2; rc=1
+    echo "TOOLCHAIN GUARD: nodejs $NODE_V, expected major $EXPECT_NODE_MAJOR" >&2; rc=1
   fi
   if [ "$(major "$POPPLER_V")" != "$EXPECT_POPPLER_MAJOR" ]; then
-    echo "TOOLCHAIN GUARD: poppler $POPPLER_V, ожидался мажор $EXPECT_POPPLER_MAJOR" >&2; rc=1
+    echo "TOOLCHAIN GUARD: poppler $POPPLER_V, expected major $EXPECT_POPPLER_MAJOR" >&2; rc=1
   fi
   if [ "$(major "$SQLITE_V")" != "$EXPECT_SQLITE_MAJOR" ]; then
-    echo "TOOLCHAIN GUARD: sqlite3 $SQLITE_V, ожидался мажор $EXPECT_SQLITE_MAJOR" >&2; rc=1
+    echo "TOOLCHAIN GUARD: sqlite3 $SQLITE_V, expected major $EXPECT_SQLITE_MAJOR" >&2; rc=1
   fi
   if [ "$rc" != 0 ]; then
     echo "" >&2
-    echo "Сборка остановлена: Alpine отдал не тот тулчейн, на котором аддон" >&2
-    echo "проверен. Прогони read_pdf_text/read_pdf_page/sqlite_query вручную," >&2
-    echo "убедись что всё работает, и обнови EXPECT_*_MAJOR в toolchain-check.sh." >&2
+    echo "Build stopped: Alpine shipped a toolchain the add-on has not been" >&2
+    echo "tested against. Run read_pdf_text/read_pdf_page/sqlite_query by hand," >&2
+    echo "make sure everything works, then update EXPECT_*_MAJOR in toolchain-check.sh." >&2
     exit 1
   fi
 }
@@ -96,27 +96,27 @@ PDF_EOF
 
   # pdfinfo: сервер парсит строку "Pages:" в pdfPageCount()
   pdfinfo "$T/smoke.pdf" | grep -Eq '^Pages:[[:space:]]+1$' \
-    || { echo "SMOKE FAIL: pdfinfo не отдал Pages: 1" >&2; exit 1; }
+    || { echo "SMOKE FAIL: pdfinfo did not report Pages: 1" >&2; exit 1; }
 
   # pdftoppm: РОВНО те флаги, что в server.js pdfPageToImage(). stderr глушится:
   # в образе нет шрифтов, poppler пишет "Couldn't find a font for 'Helvetica'"
   # и всё равно рендерит (заменяет её); сборку это не ломает — ниже уже
   # проверяются код выхода, наличие файла и его JPEG-заголовок.
   pdftoppm -jpeg -r 120 -scale-to 1400 -f 1 -l 1 "$T/smoke.pdf" "$T/page" 2>/dev/null \
-    || { echo "SMOKE FAIL: pdftoppm упал" >&2; exit 1; }
+    || { echo "SMOKE FAIL: pdftoppm failed" >&2; exit 1; }
   J=$(ls "$T"/page*.jpg 2>/dev/null | head -1)
-  [ -n "$J" ] && [ -s "$J" ] || { echo "SMOKE FAIL: pdftoppm не дал JPEG" >&2; exit 1; }
+  [ -n "$J" ] && [ -s "$J" ] || { echo "SMOKE FAIL: pdftoppm produced no JPEG" >&2; exit 1; }
   head -c 2 "$J" | od -An -tx1 | tr -d ' \n' | grep -qi 'ffd8' \
-    || { echo "SMOKE FAIL: pdftoppm дал не JPEG" >&2; exit 1; }
+    || { echo "SMOKE FAIL: pdftoppm output is not a JPEG" >&2; exit 1; }
 
   # pdftotext: РОВНО те флаги, что в server.js pdfToText()
   pdftotext -layout -f 1 -l 1 "$T/smoke.pdf" - | grep -q 'VMCP-SMOKE-OK' \
-    || { echo "SMOKE FAIL: pdftotext не извлёк маркер" >&2; exit 1; }
+    || { echo "SMOKE FAIL: pdftotext did not extract the marker" >&2; exit 1; }
 
   # sqlite3: та же командная строка, что sqlite.js использует в runSqlite() —
   # включая -cmd "PRAGMA hard_heap_limit=...", добавленный в 2.7.1.
   sqlite3 "$T/smoke.db" "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);" \
-    || { echo "SMOKE FAIL: не удалось создать тестовую базу" >&2; exit 1; }
+    || { echo "SMOKE FAIL: could not create the test database" >&2; exit 1; }
   HHL_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t")
   # Эхо прагмы — единственное место, где на каждом вызове видно, что ЭТА
   # сборка sqlite3 действительно приняла лимит: незнакомое имя PRAGMA обычно
@@ -132,14 +132,14 @@ PDF_EOF
   # стали. Проверяется поэтому именно значение, а не одна конкретная форма —
   # ровно то же самое исправление, что и в sqlite.js (see HEAP_LIMIT_ECHO_CANDIDATES).
   echo "$HHL_OUT" | grep -Eq '^(\[\{"hard_heap_limit":268435456\}\]|268435456([^0-9]|$))' \
-    || { echo "SMOKE FAIL: hard_heap_limit не подтверждён эхом прагмы (получено: $HHL_OUT)" >&2; exit 1; }
+    || { echo "SMOKE FAIL: hard_heap_limit not confirmed by the pragma echo (got: $HHL_OUT)" >&2; exit 1; }
   echo "$HHL_OUT" | grep -q '"n":3' \
-    || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json не вернул ожидаемый COUNT(*)" >&2; exit 1; }
+    || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json did not return the expected COUNT(*)" >&2; exit 1; }
 
   # -safe должна отбивать ATTACH — без этого запрос читает любой файл на
   # диске в обход проверки зон (см. sqlite-spec.md). Успешный ATTACH — провал.
   if sqlite3 -readonly -safe "$T/smoke.db" "ATTACH '/etc/passwd' AS x;" >/dev/null 2>&1; then
-    echo "SMOKE FAIL: -safe не заблокировал ATTACH" >&2; exit 1
+    echo "SMOKE FAIL: -safe did not block ATTACH" >&2; exit 1
   fi
 }
 
