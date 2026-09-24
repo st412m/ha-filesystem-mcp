@@ -205,7 +205,12 @@ CHECK_JS="$OUT/.wal-copy-check.js"
 cat > "$CHECK_JS" <<'JS'
 const path = require('path');
 const S = require(path.join(process.env.SQLITE_MODULE_DIR, 'sqlite.js'));
-const dbPath = path.join(process.env.FIXTURES_DIR, 'wal_hotcopy.db');
+const SP = require(path.join(process.env.SQLITE_MODULE_DIR, 'safepath.js'));
+// Since 2.8.0 sqlite.js takes a checked path, not a string — the same one the
+// server hands it, resolved against the vault root. A fixture directory
+// outside VAULT_PATH is refused here exactly as it would be through a tool.
+const dbPath = SP.createResolver(process.env.VAULT_PATH)
+  .resolveSafe(path.join(process.env.FIXTURES_DIR, 'wal_hotcopy.db'));
 (async () => {
   try {
     const res = await S.query(dbPath, 'SELECT COUNT(*) AS n FROM t', { timeout_ms: 15000 });
@@ -225,7 +230,7 @@ const dbPath = path.join(process.env.FIXTURES_DIR, 'wal_hotcopy.db');
   }
 })();
 JS
-SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" node "$CHECK_JS"
+SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" VAULT_PATH="$VAULT_PATH" node "$CHECK_JS"
 CHECK_RC=$?
 rm -f "$CHECK_JS"
 [ "$CHECK_RC" -eq 0 ] \
@@ -257,7 +262,9 @@ CHECK_JS="$OUT/.hard-heap-limit-check.js"
 cat > "$CHECK_JS" <<'JS'
 const path = require('path');
 const S = require(path.join(process.env.SQLITE_MODULE_DIR, 'sqlite.js'));
-const dbPath = path.join(process.env.FIXTURES_DIR, 'empty.db');
+const SP = require(path.join(process.env.SQLITE_MODULE_DIR, 'safepath.js'));
+const dbPath = SP.createResolver(process.env.VAULT_PATH)
+  .resolveSafe(path.join(process.env.FIXTURES_DIR, 'empty.db'));
 (async () => {
   try {
     await S.query(
@@ -276,7 +283,7 @@ const dbPath = path.join(process.env.FIXTURES_DIR, 'empty.db');
   }
 })();
 JS
-SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" node "$CHECK_JS"
+SQLITE_MODULE_DIR="$(cd "$(dirname "$0")/../filesystem_mcp" && pwd)" FIXTURES_DIR="$OUT" VAULT_PATH="$VAULT_PATH" node "$CHECK_JS"
 CHECK_RC=$?
 rm -f "$CHECK_JS"
 [ "$CHECK_RC" -eq 0 ] \

@@ -20,8 +20,8 @@
  */
 
 const fs = require('fs');
-const path = require('path');
 const P = require('./policy');
+const SP = require('./safepath');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -30,6 +30,8 @@ function log(msg) {
 }
 
 function sweepTrash(trashDir, days, root) {
+  const trashPath = SP.pathOf(trashDir, 'sweepTrash');
+  const rootPath = SP.pathOf(root, 'sweepTrash');
   const cutoff = Date.now() - days * DAY_MS;
   let removed = 0, bytes = 0, kept = 0, unstamped = 0;
 
@@ -38,12 +40,12 @@ function sweepTrash(trashDir, days, root) {
 
   const walk = (dir) => {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = fs.readdirSync(dir.path, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (!P.inside(full, trashDir) || !P.inside(full, root)) continue;
+      const full = SP.child(dir, e.name);
+      if (!P.inside(full.path, trashPath) || !P.inside(full.path, rootPath)) continue;
       let st;
-      try { st = fs.lstatSync(full); } catch { continue; }
+      try { st = fs.lstatSync(full.path); } catch { continue; }
       if (st.isDirectory()) { dirs.push(full); walk(full); continue; }
       if (!st.isFile()) continue;              // symlinks, sockets, devices — not ours
       const stamp = P.stampOf(e.name);
@@ -51,11 +53,11 @@ function sweepTrash(trashDir, days, root) {
       if (stamp.getTime() > cutoff) { kept++; continue; }
       const ageDays = ((Date.now() - stamp.getTime()) / DAY_MS).toFixed(1);
       try {
-        fs.unlinkSync(full);
+        fs.unlinkSync(full.path);
         removed++; bytes += st.size;
-        log(`removed ${full} · ${ageDays} d old · ${st.size} B`);
+        log(`removed ${full.path} · ${ageDays} d old · ${st.size} B`);
       } catch (err) {
-        log(`FAILED to remove ${full}: ${err.message}`);
+        log(`FAILED to remove ${full.path}: ${err.message}`);
       }
     }
   };
@@ -65,42 +67,45 @@ function sweepTrash(trashDir, days, root) {
   // Bottom-up so a directory emptied by this pass can go too. rmdir refuses a
   // non-empty directory by itself — that is the whole guard.
   let dirsRemoved = 0;
-  for (const d of dirs.sort((a, b) => b.length - a.length)) {
-    try { fs.rmdirSync(d); dirsRemoved++; } catch {}
+  for (const d of dirs.sort((a, b) => b.path.length - a.path.length)) {
+    try { fs.rmdirSync(d.path); dirsRemoved++; } catch {}
   }
 
   return { removed, bytes, kept, unstamped, dirsRemoved };
 }
 
 function runSweep(root) {
+  SP.pathOf(root, 'runSweep');
   const memo = new Map();
   let zones;
   try { zones = P.findMarkerDirs(root, memo); }
   catch (e) { log(`scan failed: ${e.message}`); return; }
   if (zones.truncated) log('marker scan hit its limit — some deep zones were not visited');
 
+  // Keyed by string: two brands for the same directory are different objects.
   const seen = new Set();
   let active = 0;
 
   for (const dir of zones.dirs) {
     const policy = P.policyForDir(dir, root, memo);
-    if (policy.error) { log(`skipping ${dir} — ${policy.error}`); continue; }
+    if (policy.error) { log(`skipping ${dir.path} — ${policy.error}`); continue; }
     if (!policy.retention_enabled) continue;
     const trashDir = P.trashDirOf(policy);
     if (!trashDir) continue;
     // Only the zone that OWNS the trash sweeps it. Otherwise a child that
-    // merely inherited the trash could order a purge of its parent's.
-    if (policy.trashOwner !== dir) continue;
-    if (seen.has(trashDir)) continue;
-    seen.add(trashDir);
-    if (policy.readonly) { log(`skipping ${trashDir} — zone is read-only, trash is meaningless there`); continue; }
+    // merely inherited the trash could order a purge of its parent's. Compared
+    // by string — the brands are never the same object.
+    if (policy.trashOwner.path !== dir.path) continue;
+    if (seen.has(trashDir.path)) continue;
+    seen.add(trashDir.path);
+    if (policy.readonly) { log(`skipping ${trashDir.path} — zone is read-only, trash is meaningless there`); continue; }
     let st;
-    try { st = fs.lstatSync(trashDir); } catch { continue; }
-    if (!st.isDirectory()) { log(`skipping ${trashDir} — not a directory`); continue; }
+    try { st = fs.lstatSync(trashDir.path); } catch { continue; }
+    if (!st.isDirectory()) { log(`skipping ${trashDir.path} — not a directory`); continue; }
 
     active++;
     const r = sweepTrash(trashDir, policy.retention_days, root);
-    log(`${trashDir}: removed ${r.removed} file(s), ${(r.bytes / 1024).toFixed(1)} KB, ` +
+    log(`${trashDir.path}: removed ${r.removed} file(s), ${(r.bytes / 1024).toFixed(1)} KB, ` +
         `${r.dirsRemoved} empty dir(s); kept ${r.kept} newer than ${policy.retention_days} d` +
         (r.unstamped ? `, left ${r.unstamped} unstamped file(s) alone` : ''));
   }
@@ -110,6 +115,7 @@ function runSweep(root) {
 
 // At start, then once a day. unref() so the timer never holds the process up.
 function start(root) {
+  SP.pathOf(root, 'start');
   const tick = () => { try { runSweep(root); } catch (e) { log(`sweep crashed: ${e.message}`); } };
   setTimeout(tick, 5000).unref();
   setInterval(tick, DAY_MS).unref();

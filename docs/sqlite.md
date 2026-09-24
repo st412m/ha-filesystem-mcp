@@ -53,9 +53,16 @@ Row counts are off by default because `COUNT(*)` is a full table scan. Call once
 | `limit` | number | 100 | 1–1000 |
 | `timeout_ms` | number | 5000 | 1–30000 |
 
-The statement must start with `SELECT`, `WITH` or `VALUES`, and may end with one `;`. It runs wrapped as `SELECT * FROM (<sql>) LIMIT <limit+1>`. The extra row is how truncation is detected.
+The statement must start with `SELECT`, `WITH`, `VALUES` or `EXPLAIN`, and may end with one `;`. It runs wrapped as `SELECT * FROM (<sql>) LIMIT <limit+1>`, with the query on a line of its own. The extra row is how truncation is detected.
 
-The `EXPLAIN` keyword passes the statement check, but the query is wrapped as `SELECT * FROM (<sql>)` and SQLite rejects that construction with a syntax error, so `EXPLAIN` cannot be run through `sqlite_query`.
+The statement is tokenized before `sqlite3` is started, the way SQLite's own tokenizer reads it. A `;` inside a string literal, a quoted identifier or a comment is part of the text and is accepted; a `;` anywhere else ends a statement and is refused. Bind parameters — `?`, `:x`, `@x`, `$x`, `#x` — are refused outright: `sqlite_query` has nothing to bind them to, and `$name(…)` in particular is a piece of syntax no scanner short of SQLite's own reads correctly. Unterminated literals and block comments, and unbalanced parentheses, are refused as well, because the wrapper around the query can only hold if they are balanced.
+
+`EXPLAIN` and `EXPLAIN QUERY PLAN` are accepted as well, and what follows the keyword must itself start with `SELECT`, `WITH` or `VALUES`. The modifier is lifted out of the wrapper — `SELECT * FROM (EXPLAIN …)` is not something SQLite will parse — so the statement actually run is `EXPLAIN … SELECT * FROM (<sql>) LIMIT <limit+1>`.
+
+Two consequences:
+
+- The plan describes the **wrapped** statement, not the one you sent. For a composite query or an aggregate the plan gains rows the bare query would not produce, typically `CO-ROUTINE` and `SCAN (subquery-N)`.
+- `limit` does not reach the plan. SQLite emits the whole listing and it is clipped afterwards, so `truncated` still tells the truth, but a very large plan runs into `OUTPUT_TOO_LARGE` with no partial result returned.
 
 Response fields: `path`, `size`, `mtime_utc`, `mtime_local`, `wal_copy`, `wal_copy_ms`, `columns`, `rows` (array of objects), `row_count`, `truncated` (`true` when there were more rows than `limit`), `elapsed_ms`.
 
@@ -70,8 +77,10 @@ Every error starts with a code:
 | `NOT_FOUND` | the path does not exist or is not a regular file |
 | `NOT_SQLITE` | the first sixteen bytes are not a SQLite header; they are quoted in hex, and as ASCII when printable |
 | `DOT_COMMAND` | the statement starts with `.` |
-| `MULTIPLE_STATEMENTS` | a `;` anywhere except one trailing `;` |
-| `INVALID_STATEMENT` | the statement does not start with an accepted keyword |
+| `MALFORMED_SQL` | an unterminated string literal, quoted identifier, `[identifier]` or `/* comment`; a parenthesis with no match; a NUL character. The position is given as a character offset |
+| `PARAMETERS_NOT_SUPPORTED` | a bind parameter (`?`, `:x`, `@x`, `$x`, `#x`) — there is nothing to bind it to |
+| `MULTIPLE_STATEMENTS` | a `;` that ends a statement, that is, one outside a string literal, a quoted identifier or a comment; one trailing `;` is allowed |
+| `INVALID_STATEMENT` | the statement does not start with `SELECT`, `WITH`, `VALUES` or `EXPLAIN`; or it starts with `EXPLAIN` and what follows is not whitespace and then a `SELECT`, `WITH` or `VALUES` of its own |
 | `QUERY_TIMEOUT` | the query ran longer than `timeout_ms` (or a count longer than `counts_timeout_ms`) and was killed |
 | `QUERY_TOO_LARGE` | the query needed more than 256 MiB of working memory — a large sort, `group_concat()` over many rows, `hex()` on a big BLOB |
 | `OUTPUT_TOO_LARGE` | `sqlite3` produced more than 1 MiB of output; no partial result is returned |
@@ -81,7 +90,9 @@ Every error starts with a code:
 | `SQLITE_MISSING` | the `sqlite3` binary is not installed |
 | `SQLITE_ERROR` | any other error from `sqlite3`, with its message |
 
-The statement checks run before `sqlite3` is started, in the order `DOT_COMMAND`, `MULTIPLE_STATEMENTS`, `INVALID_STATEMENT`. The `;` check is a plain search, so a query with a semicolon inside a string literal is refused too. Rewrite the query without it, for example with `char(59)`.
+The five statement checks — `DOT_COMMAND`, `MALFORMED_SQL`, `PARAMETERS_NOT_SUPPORTED`, `MULTIPLE_STATEMENTS`, `INVALID_STATEMENT` — all run before `sqlite3` is started. When a statement is wrong in more than one way the answer is picked by seriousness, not by position, in exactly that order. A statement whose parentheses do not balance and which also carries a stray `;` is reported as malformed, which is the more useful of the two things to be told.
+
+Where the tokenizer and SQLite could disagree, it refuses rather than accepts: `/*` as the last two characters of a query is division to SQLite and an unterminated comment here.
 
 An unknown parameter name is an error, not a silent no-op.
 

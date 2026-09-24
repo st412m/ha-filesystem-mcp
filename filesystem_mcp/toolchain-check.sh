@@ -136,6 +136,18 @@ PDF_EOF
   echo "$HHL_OUT" | grep -q '"n":3' \
     || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json did not return the expected COUNT(*)" >&2; exit 1; }
 
+  # EXPLAIN, through the same argv sqlite.js uses, including the -cmd
+  # ".explain off" added in 2.8.0. Without that flag the CLI ignores -json for
+  # EXPLAIN and EXPLAIN QUERY PLAN and draws a fixed-column text table instead,
+  # which sqlite.js can only report as MALFORMED_OUTPUT. A dot-command that
+  # -safe refuses does not change the exit status, so the output itself is what
+  # is checked: one line that both opens the JSON array and carries a quoted
+  # column name. The drawn table has the word opcode in it too, but never in
+  # quotes, and the pragma echo never mentions it at all.
+  EXP_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -cmd ".explain off" -readonly -safe -json "$T/smoke.db" "EXPLAIN SELECT 1 AS x")
+  echo "$EXP_OUT" | grep -q '^\[{.*"opcode"' \
+    || { echo "SMOKE FAIL: EXPLAIN did not come back as JSON — .explain off had no effect (got: $(echo "$EXP_OUT" | head -3 | tr '\n' ' '))" >&2; exit 1; }
+
   # -safe должна отбивать ATTACH — без этого запрос читает любой файл на
   # диске в обход проверки зон (см. sqlite-spec.md). Успешный ATTACH — провал.
   if sqlite3 -readonly -safe "$T/smoke.db" "ATTACH '/etc/passwd' AS x;" >/dev/null 2>&1; then
@@ -155,6 +167,7 @@ case "${1:-runtime}" in
       echo "pdf-pipeline(pdfinfo+pdftoppm+pdftotext): ok"
       echo "sqlite3: $SQLITE_V"
       echo "sqlite-pipeline(readonly+safe+json, ATTACH blocked): ok"
+      echo "sqlite-explain(.explain off -> json): ok"
     } > "$MANIFEST"
     echo "Toolchain OK -> $(tr '\n' '; ' < "$MANIFEST")"
     ;;

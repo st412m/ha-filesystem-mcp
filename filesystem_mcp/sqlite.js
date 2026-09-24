@@ -6,13 +6,21 @@
  * sqlite_query() runs exactly one read-only statement. Neither interprets the
  * data — no table or column name anywhere in this file is special-cased.
  *
- * All protection against writes and against escaping the vault through SQL
- * rests on three flags: `-readonly` (SQLITE_OPEN_READONLY), `-safe` (disables
+ * Protection against writes and against escaping the vault through SQL rests
+ * on three things: `-readonly` (SQLITE_OPEN_READONLY), `-safe` (disables
  * ATTACH, .shell, .system, .open, writefile(), edit(), load_extension(),
  * fts3_tokenizer() — ATTACH matters most, since without it a query reads any
- * file on disk regardless of the vault's own zone check), and the
- * `SELECT * FROM (<sql>) LIMIT <n>` wrapper in query() (single statement,
- * read-only shape, truncation detection).
+ * file on disk regardless of the vault's own zone check), and scanSql(), which
+ * tokenizes the statement before sqlite3 is ever started.
+ *
+ * The `SELECT * FROM (<sql>) LIMIT <n>` wrapper is NOT one of them, and until
+ * 2.8.0 the comments here said otherwise. A wrapper can be closed from the
+ * inside: `SELECT 1 AS x) ; SELECT 2 AS y /*` ends up as two statements, the
+ * `)` closing the wrapper's parenthesis and the unterminated `/*` swallowing
+ * the `) LIMIT n` that should have followed — measured, both statements ran.
+ * The wrapper gives a row limit, truncation detection and a row-producing
+ * shape, and it can only do that because the scanner has already guaranteed
+ * balanced parentheses, closed comments and no second statement.
  *
  * 2.7.2 adds a fourth concern, orthogonal to the three above: how the file
  * gets opened at all. A plain `-readonly` open of a WAL-mode database still
@@ -22,22 +30,20 @@
  * prepareOpen() below for the fix (immutable URI or a private copy) and
  * sqlite-spec-272.md §1 for the measurement behind it.
  *
- * schema()/query() do NOT check the path themselves — they trust it. The
- * `p` argument MUST be the return value of server.js's resolveSafe(), called
- * before either function here. This module has no idea what the vault root
- * is and performs no containment check of its own, on purpose (matches
- * policy.js: neither module duplicates resolveSafe's escape-hardening,
- * which took two rounds to get right — see its comment on the 2.5.0
- * symlink/sibling-prefix fix). Calling either function with anything else —
- * a raw path from args, a path built by hand, a path from a different
- * dispatcher — reads or reports on any file the process can see, vault or
- * not; there is nothing in this module that will stop it or even notice.
- * Confirmed exactly this way in 2.7.1's acceptance: calling query()/schema()
- * directly, bypassing server.js, read a file outside the vault. Two known
- * fixes were considered and deferred to a separate release (see
- * sqlite-spec.md's "Проверка зоны" section) — this file has not changed to
- * address it, so the trust-the-caller behaviour above is not a stale comment,
- * it is still exactly how this module works today.
+ * schema()/query() still perform no containment check of their own — this
+ * module has no idea where the vault root is, and neither it nor policy.js
+ * duplicates resolveSafe's escape-hardening, which took two rounds to get
+ * right (see the 2.5.0 symlink/sibling-prefix note in safepath.js). What
+ * changed in 2.8.0 is that the contract is now checked instead of assumed:
+ * `p` must be a path produced by safepath.js, and pathOf() refuses anything
+ * else with UNVERIFIED_PATH before a single byte is read. Until 2.7.3 this
+ * was a comment, and 2.7.1's acceptance walked straight past it — calling
+ * query()/schema() directly with a string, bypassing server.js, read a file
+ * outside the vault. That call now throws.
+ *
+ * Past the entry point the path is an ordinary string again: this module
+ * derives -wal/-shm siblings and a temp copy from it, and none of those are
+ * vault paths to be checked.
  *
  * Called the same way server.js calls pdftotext/pdftoppm for read_pdf_text/
  * read_pdf_page: execFile with an argv array (SQL is one argv element, never
@@ -48,6 +54,7 @@ const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const SP = require('./safepath');
 
 const SQLITE_BIN = 'sqlite3';
 const SQLITE_HEADER = 'SQLite format 3\0'; // exactly 16 bytes
@@ -391,7 +398,14 @@ function runSqliteChecked(openPath, sql, timeoutMs) {
     // ?immutable=1` URI, or the path of our own copy — sqlite3 parses the URI
     // form on this build without needing a `-uri` flag (that flag does not
     // exist on Alpine's sqlite3 3.49.2 at all — confirmed, do not add it).
-    const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-readonly', '-safe', '-json', openPath, sql];
+    // `.explain off` is load-bearing for EXPLAIN: the CLI switches itself into
+    // a fixed-column text layout for EXPLAIN and EXPLAIN QUERY PLAN output and
+    // ignores -json while it is on, so parseJsonRows() would see a drawn table
+    // and raise MALFORMED_OUTPUT. Turning it off restores JSON (addr/opcode/p1…
+    // and id/parent/notused/detail). It must stay AFTER the pragma: the echo
+    // check below expects the pragma's own output to be the first bytes on
+    // stdout, and `.explain off` prints nothing of its own.
+    const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-cmd', '.explain off', '-readonly', '-safe', '-json', openPath, sql];
 
     let child;
     try {
@@ -482,7 +496,9 @@ async function sqliteVersion() {
 // sqlite_schema
 // ---------------------------------------------------------------------------
 
-async function schema(p, opts) {
+async function schema(brandedPath, opts) {
+  // One unwrap at the entry point; everything below works on the string.
+  const p = SP.pathOf(brandedPath, 'sqlite_schema');
   opts = opts || {};
   assertKnownOptions(opts, SCHEMA_OPTION_KEYS, 'sqlite_schema');
   const wantCounts = opts.counts === true || opts.counts === 'true';
@@ -561,10 +577,149 @@ async function schema(p, opts) {
 // sqlite_query
 // ---------------------------------------------------------------------------
 
+function firstKeyword(s) {
+  const m = /^([A-Za-z]+)/.exec(s);
+  return m ? m[1].toUpperCase() : '';
+}
+
+// EXPLAIN and EXPLAIN QUERY PLAN are modifiers, not statements: what follows
+// has to be a statement in its own right. Whitespace only after the keyword —
+// a comment there (EXPLAIN/**/SELECT 1) does not match and is refused, which
+// is the conservative side to be on.
+const EXPLAIN_PREFIX_RE = /^EXPLAIN(\s+QUERY\s+PLAN)?\s+/i;
+const EXPLAINABLE_KEYWORDS = STATEMENT_KEYWORDS.filter(k => k !== 'EXPLAIN');
+
+// Tokenizer, not a parser: it walks the statement once and records what it
+// finds, so that a ";" inside a string literal, a quoted identifier or a
+// comment is left alone while a ";" that really does end a statement is
+// caught. Until 2.8.0 this was sql.includes(';'), which refused the first and
+// was the only thing standing between a crafted query and a second statement.
+//
+// The rules below are taken from SQLite's own src/tokenize.c
+// (sqlite3GetToken, tag version-3.49.2). Where this disagrees with SQLite it
+// may only disagree by refusing more, never less — `/*` at the very end of the
+// input is SQLite's division operator and our unterminated comment, and that
+// asymmetry is the acceptable direction.
+//
+// Bind parameters are refused outright rather than modelled. SQLite reads
+// $name(...) as ONE token and consumes everything up to a ")" or whitespace
+// inside those brackets, quote characters included, so a scanner that knows
+// only strings, comments and parentheses is walked straight through by
+// `SELECT 1 AS x WHERE $a(') ) ; SELECT 2 AS y /*')` — it sees $a( then a
+// string then ), while sqlite3 runs the second statement. Modelling that
+// syntax to keep a feature nothing here can use would be the wrong trade:
+// sqlite_query has no parameters to bind in the first place.
+//
+// Pure: it reads the string and returns what it found. The caller decides
+// which finding to raise.
+const PARAMETER_CHARS = new Set(['$', '@', ':', '#', '?']);
+
+function scanSql(sql) {
+  const findings = [];
+  const seen = new Set();
+  // One finding per code, the earliest — several ";" are one answer, not five.
+  const add = (code, message) => { if (!seen.has(code)) { seen.add(code); findings.push({ code, message }); } };
+
+  // NUL is checked over the whole input, literals and comments included: it
+  // ends SQLite's token stream wherever it sits, so it is never just data.
+  const nul = sql.indexOf('\0');
+  if (nul !== -1) add('MALFORMED_SQL', `MALFORMED_SQL: NUL character at character ${nul}`);
+
+  const openParens = [];
+  const n = sql.length;
+  let i = 0;
+  while (i < n) {
+    const c = sql[i];
+
+    // Quoted: '…' string, "…" and `…` identifiers. A doubled delimiter is an
+    // escape and the literal continues; a single one closes it.
+    if (c === "'" || c === '"' || c === '`') {
+      const what = c === "'" ? 'string literal' : 'quoted identifier';
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) { add('MALFORMED_SQL', `MALFORMED_SQL: unterminated ${what} starting at character ${i}`); i = n; break; }
+        if (sql[j] === c) {
+          if (sql[j + 1] === c) { j += 2; continue; }
+          i = j + 1; break;
+        }
+        j++;
+      }
+      continue;
+    }
+
+    // [identifier] — closed by the first "]", no escaping inside.
+    if (c === '[') {
+      const end = sql.indexOf(']', i + 1);
+      if (end === -1) { add('MALFORMED_SQL', `MALFORMED_SQL: unterminated [identifier] starting at character ${i}`); i = n; }
+      else i = end + 1;
+      continue;
+    }
+
+    // -- to the end of the line. Only "\n" ends it, not "\r". Running to the
+    // end of the input is fine: the wrapper puts a newline after the query.
+    if (c === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i + 2);
+      i = nl === -1 ? n : nl + 1;
+      continue;
+    }
+
+    // /* … */ — the search for the terminator starts past both opening
+    // characters, so /**/ is closed and /*/ is not.
+    if (c === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      if (end === -1) { add('MALFORMED_SQL', `MALFORMED_SQL: unterminated /* comment starting at character ${i}`); i = n; }
+      else i = end + 2;
+      continue;
+    }
+
+    if (PARAMETER_CHARS.has(c)) {
+      add('PARAMETERS_NOT_SUPPORTED', `PARAMETERS_NOT_SUPPORTED: bind parameter "${c}" at character ${i} — sqlite_query has nothing to bind it to; write the value into the SQL as a literal`);
+      i++;
+      continue;
+    }
+
+    if (c === '(') { openParens.push(i); i++; continue; }
+
+    if (c === ')') {
+      if (openParens.length) openParens.pop();
+      else add('MALFORMED_SQL', `MALFORMED_SQL: ")" at character ${i} has no matching "("`);
+      i++;
+      continue;
+    }
+
+    if (c === ';') {
+      add('MULTIPLE_STATEMENTS', `MULTIPLE_STATEMENTS: only one statement is accepted — ";" at character ${i} ends a statement. A ";" inside a string literal, a quoted identifier or a comment is fine.`);
+      i++;
+      continue;
+    }
+
+    // Everything else is an ordinary character, backslash included — SQLite
+    // has no backslash escape. That covers the x of a blob literal too: the
+    // "'" after it opens a string here, and SQLite closes the blob on the same
+    // "'" we close the string on.
+    i++;
+  }
+
+  if (openParens.length)
+    add('MALFORMED_SQL', `MALFORMED_SQL: "(" at character ${openParens[0]} is never closed`);
+
+  return findings;
+}
+
+// Raised by priority, not by position: an unbalanced parenthesis and a ";"
+// in the same statement mean the statement is malformed, and saying so is more
+// use than pointing at the ";".
+const SCAN_PRIORITY = ['MALFORMED_SQL', 'PARAMETERS_NOT_SUPPORTED', 'MULTIPLE_STATEMENTS'];
+
 // Checks run in this exact order, each with its own error code — see
-// sqlite-spec.md. This is not the protection mechanism (that is -readonly,
-// -safe and the LIMIT wrapper below); it exists so a mistake gets a legible
-// error instead of a raw SQLite syntax error.
+// sqlite-spec.md. Since 2.8.0 these checks ARE the protection against a second
+// statement, alongside -readonly and -safe: nothing downstream would catch one.
+//
+// Returns the statement split into the part that must stay OUTSIDE the wrapper
+// and the part that goes inside it. `prefix` is empty for everything except
+// EXPLAIN: SELECT * FROM (EXPLAIN …) is not a query SQLite will parse, so the
+// modifier is lifted out and the wrapper closes around the statement it
+// modifies instead.
 function validateSql(rawSql) {
   if (typeof rawSql !== 'string') throw new Error('sql must be a string');
   let sql = rawSql.trim();
@@ -574,16 +729,28 @@ function validateSql(rawSql) {
     const word = sql.split(/\s/)[0];
     throw new Error(`DOT_COMMAND: dot-commands are not accepted ("${word}") — -safe does not filter all of them out of argv, so they are refused here first.`);
   }
-  if (sql.includes(';'))
-    throw new Error('MULTIPLE_STATEMENTS: only one statement is accepted. This also rejects a ";" that legitimately appears inside a string literal — split the query instead. See DOCS.md.');
-  const m = /^([A-Za-z]+)/.exec(sql);
-  const kw = m ? m[1].toUpperCase() : '';
+  const findings = scanSql(sql);
+  for (const code of SCAN_PRIORITY) {
+    const f = findings.find(x => x.code === code);
+    if (f) throw new Error(f.message);
+  }
+  const kw = firstKeyword(sql);
   if (!STATEMENT_KEYWORDS.includes(kw))
     throw new Error(`INVALID_STATEMENT: statement must start with ${STATEMENT_KEYWORDS.join(', ')} — got "${sql.slice(0, 30)}"`);
-  return sql;
+
+  if (kw !== 'EXPLAIN') return { prefix: '', sql };
+
+  const m = EXPLAIN_PREFIX_RE.exec(sql);
+  if (!m)
+    throw new Error(`INVALID_STATEMENT: EXPLAIN and EXPLAIN QUERY PLAN must be followed by whitespace and the statement to explain — got "${sql.slice(0, 30)}"`);
+  const body = sql.slice(m[0].length);
+  if (!EXPLAINABLE_KEYWORDS.includes(firstKeyword(body)))
+    throw new Error(`INVALID_STATEMENT: what follows EXPLAIN must start with ${EXPLAINABLE_KEYWORDS.join(', ')} — got "${body.slice(0, 30)}"`);
+  return { prefix: m[0], sql: body };
 }
 
-async function query(p, rawSql, opts) {
+async function query(brandedPath, rawSql, opts) {
+  const p = SP.pathOf(brandedPath, 'sqlite_query');
   opts = opts || {};
   assertKnownOptions(opts, QUERY_OPTION_KEYS, 'sqlite_query');
   const limit = clampInt(opts.limit, DEFAULT_LIMIT, 1, MAX_LIMIT, 'limit');
@@ -591,14 +758,24 @@ async function query(p, rawSql, opts) {
 
   const st = assertRegularFile(p);
   checkSqliteHeader(p);
-  const sql = validateSql(rawSql);
+  const { prefix, sql } = validateSql(rawSql);
 
-  // The wrapper does three things at once: guarantees a single statement,
-  // rejects anything that is not a row-producing expression, and gives a
-  // truncation signal for free — asking for limit+1 rows and dropping the
-  // extra one if it came back. A recursive CTE inside the subquery is parsed
-  // by SQLite normally.
-  const wrapped = `SELECT * FROM (${sql}) LIMIT ${limit + 1}`;
+  // The wrapper rejects anything that is not a row-producing expression and
+  // gives a truncation signal for free — asking for limit+1 rows and dropping
+  // the extra one if it came back. It does NOT guarantee a single statement;
+  // scanSql() does, and the wrapper is only safe to build because of it. A
+  // recursive CTE inside the subquery is parsed by SQLite normally.
+  //
+  // The newlines around the query are load-bearing. A perfectly legal "--"
+  // comment at the end of the query would otherwise run on into the ") LIMIT n"
+  // and swallow it; a newline ends the comment before the wrapper closes.
+  //
+  // An EXPLAIN prefix sits in front of the whole wrapper, never inside it, so
+  // what gets explained is the wrapped statement. Two consequences, both in
+  // the tool description: the plan shows the wrapper's own rows, and LIMIT
+  // does not reach the opcode listing at all — sqlite returns every row and
+  // the clipping below is what shortens it.
+  const wrapped = `${prefix}SELECT * FROM (\n${sql}\n) LIMIT ${limit + 1}`;
 
   const { openPath, cleanup, viaCopy, copyMs } = prepareOpen(p);
   let rows, elapsedMs;

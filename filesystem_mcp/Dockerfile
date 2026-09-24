@@ -51,6 +51,7 @@ COPY run.sh /run.sh
 COPY toolchain-check.sh /toolchain-check.sh
 COPY proxy.js /proxy.js
 COPY server.js /server.js
+COPY safepath.js /safepath.js
 COPY policy.js /policy.js
 COPY policy-ui.js /policy-ui.js
 COPY retention.js /retention.js

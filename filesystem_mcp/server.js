@@ -13,6 +13,7 @@ const path = require('path');
 const os = require('os');
 const P = require('./policy');
 const SQLITE = require('./sqlite');
+const SP = require('./safepath');
 
 // grep_files runs in a forked copy of THIS file (argv: --grep-worker <vault>).
 // Rationale: node has no way to time out a regex. A catastrophically
@@ -25,41 +26,17 @@ const VERSION = process.env.ADDON_VERSION || '0.0.0-dev';
 const ALLOWED_DIR = path.resolve((GREP_WORKER ? process.argv[3] : process.argv[2]) || '/media/VAULT');
 const PORT = parseInt(process.argv[3] || '3099');
 
-// Real path of the vault, resolved once. The vault root itself is often reached
-// through a symlink on HAOS (/media → /mnt/data/supervisor/media), so escape
-// checks must compare against the resolved root, not the literal one.
-let REAL_ROOT = ALLOWED_DIR;
-try { REAL_ROOT = fs.realpathSync(ALLOWED_DIR); } catch {}
+// The zone check and its hardening now live in safepath.js — one copy for the
+// whole add-on. resolveSafe() hands back a branded path, not a string: every
+// fs call below takes `.path` at the syscall itself, and policy.js, sqlite.js
+// and retention.js refuse anything that did not come from here.
+const R = SP.createResolver(ALLOWED_DIR);
+const resolveSafe = R.resolveSafe;
 
-function inside(p, root) {
-  return p === root || p.startsWith(root + path.sep);
-}
-
-// Hardened in 2.5.0. Two holes were closed:
-//   1. startsWith(ALLOWED_DIR) alone accepted sibling directories whose name
-//      merely shares the prefix (/media/VAULT_backup passed for /media/VAULT).
-//   2. Symlinks inside the vault pointing outside it were followed silently —
-//      `..` was blocked, a symlink was not.
-// For paths that do not exist yet (write_file, create_directory, move_file
-// destinations) the nearest existing ancestor is resolved instead.
-function resolveSafe(p) {
-  if (typeof p !== 'string' || !p) throw new Error('path must be a non-empty string');
-  const resolved = path.resolve(p);
-  if (!inside(resolved, ALLOWED_DIR)) throw new Error(`Access denied: ${p}`);
-  let probe = resolved;
-  for (;;) {
-    try {
-      const real = fs.realpathSync(probe);
-      if (!inside(real, REAL_ROOT)) throw new Error(`Access denied (symlink escapes the vault): ${p}`);
-      return resolved;
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-      const parent = path.dirname(probe);
-      if (parent === probe || !inside(parent, ALLOWED_DIR)) throw new Error(`Access denied: ${p}`);
-      probe = parent;
-    }
-  }
-}
+// The directory holding a verified path. Not path.dirname(): resolveSafe
+// checks realpath at the path itself, not at its ancestors, so going up is a
+// full check of its own. See safepath.parent().
+const parentDir = R.parent;
 
 // Short content digest used as an optimistic lock for line-addressed edits.
 function revOf(text) {
@@ -67,7 +44,7 @@ function revOf(text) {
 }
 
 function revOfFile(p) {
-  return revOf(fs.readFileSync(p, 'utf8'));
+  return revOf(fs.readFileSync(p.path, 'utf8'));
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +55,11 @@ function revOfFile(p) {
 // call and dies with it.
 
 function policyOfDir(dir, memo) {
-  return P.policyForDir(dir, ALLOWED_DIR, memo);
+  return P.policyForDir(dir, R.root, memo);
 }
 
 function assertNotMarker(p, verb) {
-  if (path.basename(p) === P.POLICY_FILE)
+  if (path.basename(p.path) === P.POLICY_FILE)
     throw new Error(`${P.POLICY_FILE} cannot be ${verb} through MCP tools — the marker is owned by the add-on's "Vault policies" page (Home Assistant sidebar). A directory or file of that name created here would lock the zone with no way to repair it from this side.`);
 }
 
@@ -90,24 +67,27 @@ function assertNotMarker(p, verb) {
 // policy of the directory that holds p.
 function guardWrite(p, memo, verb) {
   assertNotMarker(p, verb);
-  const dir = path.dirname(p);
+  // parentDir, not path.dirname: on 2.7.3 a destination reached through a
+  // symlink out of the vault and back in took its policy from the lexical
+  // chain, i.e. from the wrong zone. The parent is re-checked for real.
+  const dir = parentDir(p);
   const policy = policyOfDir(dir, memo);
   if (policy.error) throw new Error(`Refused — ${policy.error}`);
   if (policy.readonly)
-    throw new Error(`Refused — ${dir} is read-only by policy (${P.describePolicy(policy, dir)}). Nothing was written.`);
+    throw new Error(`Refused — ${dir.path} is read-only by policy (${P.describePolicy(policy, dir.path)}). Nothing was written.`);
   return policy;
 }
 
 // Second gate: the object already exists, so this is a change to existing
 // content rather than a creation.
 function guardOverwrite(p, policy, rev, what) {
-  if (!fs.existsSync(p)) return false;
+  if (!fs.existsSync(p.path)) return false;
   if (policy.overwrite === 'never')
-    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p))}): ${p} already exists and existing files may not be ${what}. Nothing was written.`);
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p.path))}): ${p.path} already exists and existing files may not be ${what}. Nothing was written.`);
   if (policy.overwrite === 'rev') {
     let cur;
     try { cur = revOfFile(p); }
-    catch (e) { throw new Error(`Refused — policy "overwrite: rev", but the current rev of ${p} cannot be read (${e.message}).`); }
+    catch (e) { throw new Error(`Refused — policy "overwrite: rev", but the current rev of ${p.path} cannot be read (${e.message}).`); }
     if (rev === undefined || rev === null || rev === '')
       throw new Error(`Refused — policy "overwrite: rev": changing an existing file requires its current rev, which is ${cur}. Nothing was written. Repeat the call with rev: "${cur}".`);
     if (String(rev) !== cur)
@@ -121,7 +101,7 @@ function guardOverwrite(p, policy, rev, what) {
 // free zone, edit there, move back — the way back counts as a creation.
 function guardTakeOut(p, policy, rev, verb) {
   if (policy.overwrite === 'never')
-    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p))}): existing files may not be ${verb} out of this zone.`);
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p.path))}): existing files may not be ${verb} out of this zone.`);
   if (policy.overwrite === 'rev') {
     const cur = revOfFile(p);
     if (rev === undefined || rev === null || rev === '')
@@ -139,9 +119,9 @@ function orphanTrashNote(dir, policy) {
   if (policy.trash) names.add(policy.trash);
   const notes = [];
   for (const n of names) {
-    const cand = path.join(dir, n);
-    if (cand === live) continue;
-    try { if (fs.lstatSync(cand).isDirectory()) notes.push(`⚠ ${cand} looks like a trash directory but no policy in force claims it — left alone.`); } catch {}
+    const cand = SP.child(dir, n);
+    if (live && cand.path === live.path) continue;
+    try { if (fs.lstatSync(cand.path).isDirectory()) notes.push(`⚠ ${cand.path} looks like a trash directory but no policy in force claims it — left alone.`); } catch {}
   }
   return notes;
 }
@@ -189,7 +169,7 @@ function coerceArray(v, name) {
 
 async function pdfPageCount(p) {
   return new Promise(resolve => {
-    execFile('pdfinfo', [p], (err, stdout) => {
+    execFile('pdfinfo', [p.path], (err, stdout) => {
       const m = (stdout || '').match(/Pages:\s+(\d+)/);
       resolve(m ? parseInt(m[1]) : 1);
     });
@@ -202,7 +182,7 @@ async function pdfPageToImage(p, n) {
     await new Promise((res, rej) => execFile('pdftoppm', [
       '-jpeg', '-r', '120', '-scale-to', '1400',
       '-f', String(n), '-l', String(n),
-      p, path.join(tmp, 'page')
+      p.path, path.join(tmp, 'page')
     ], e => e ? rej(e) : res()));
     const files = fs.readdirSync(tmp).filter(f => f.endsWith('.jpg')).sort();
     if (!files.length) throw new Error('pdftoppm: no output');
@@ -215,7 +195,7 @@ async function pdfPageToImage(p, n) {
 async function pdfToText(p, first, last) {
   return new Promise((res, rej) => {
     execFile('pdftotext', [
-      '-layout', '-f', String(first), '-l', String(last), p, '-'
+      '-layout', '-f', String(first), '-l', String(last), p.path, '-'
     ], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => err ? rej(err) : res(stdout));
   });
 }
@@ -231,16 +211,16 @@ function mimeType(ext) {
 }
 
 function listDir(p) {
-  return fs.readdirSync(p, { withFileTypes: true })
+  return fs.readdirSync(p.path, { withFileTypes: true })
     .map(e => `${e.isDirectory() ? '[DIR]' : '[FILE]'} ${e.name}`).join('\n');
 }
 
 function listDirWithSizes(p, sortBy = 'name') {
-  const entries = fs.readdirSync(p, { withFileTypes: true });
+  const entries = fs.readdirSync(p.path, { withFileTypes: true });
   const items = entries.map(e => {
-    const full = path.join(p, e.name);
+    const full = SP.child(p, e.name);
     let size = 0;
-    try { size = e.isFile() ? fs.statSync(full).size : 0; } catch {}
+    try { size = e.isFile() ? fs.statSync(full.path).size : 0; } catch {}
     return { isDir: e.isDirectory(), name: e.name, size };
   });
   if (sortBy === 'size') items.sort((a, b) => b.size - a.size);
@@ -260,9 +240,9 @@ function dirTree(p, memo, policy, level, hidden) {
   if (level > 2) return '';
   const trash = P.trashDirOf(policy);
   const indent = '  '.repeat(level);
-  return fs.readdirSync(p, { withFileTypes: true }).map(e => {
-    const full = path.join(p, e.name);
-    if (e.isDirectory() && trash && full === trash) { hidden.n++; return null; }
+  return fs.readdirSync(p.path, { withFileTypes: true }).map(e => {
+    const full = SP.child(p, e.name);
+    if (e.isDirectory() && trash && full.path === trash.path) { hidden.n++; return null; }
     const line = `${indent}${e.isDirectory() ? '[DIR]' : '[FILE]'} ${e.name}`;
     if (e.isDirectory() && level < 2) {
       const sub = dirTree(full, memo, P.applyMarker(policy, full, memo), level + 1, hidden);
@@ -311,34 +291,42 @@ function grepRun(job) {
   const excRe = job.exclude ? globToRe(job.exclude) : null;
   const maxLine = job.maxLineLength;
 
+  // The job crosses a process boundary, so the root arrives as a plain string —
+  // a brand does not survive IPC, and it should not: the worker checks the
+  // path against its own root rather than trusting what it was sent. Twice
+  // over, deliberately.
+  const root = resolveSafe(job.root);
+
+  // Strings from here on: these are read-only paths produced by a walk of an
+  // already-checked root, and they get sorted and printed.
   const files = [];
-  const st = fs.lstatSync(job.root);
+  const st = fs.lstatSync(root.path);
   if (st.isFile()) {
-    files.push(job.root);
+    files.push(root.path);
   } else if (st.isDirectory()) {
     const memo = new Map();
     const walk = (dir, policy) => {
       const trash = P.trashDirOf(policy);
       let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      try { entries = fs.readdirSync(dir.path, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
-        const full = path.join(dir, e.name);
+        const full = SP.child(dir, e.name);
         if (e.isSymbolicLink()) continue;               // no loops, no escapes
         if (e.isDirectory()) {
           if (GREP_SKIP_DIRS.has(e.name)) continue;
-          if (trash && full === trash) continue;        // trash is not searchable
+          if (trash && full.path === trash.path) continue;   // trash is not searchable
           if (excRe && excRe.test(e.name)) continue;
           walk(full, P.applyMarker(policy, full, memo));
         } else if (e.isFile()) {
           if (excRe && excRe.test(e.name)) continue;
           if (incRe && !incRe.test(e.name)) continue;
-          files.push(full);
+          files.push(full.path);
         }
       }
     };
-    walk(job.root, P.policyForDir(job.root, ALLOWED_DIR, memo));
+    walk(root, P.policyForDir(root, R.root, memo));
   } else {
-    throw new Error(`not a file or directory: ${job.root}`);
+    throw new Error(`not a file or directory: ${root.path}`);
   }
   files.sort();
 
@@ -514,7 +502,7 @@ const TOOLS = [
   },
   {
     name: 'sqlite_query',
-    description: 'Run exactly one read-only SQL statement against a SQLite database file (sqlite3 -readonly -safe -json — ATTACH, .shell and other escapes are disabled). Must start with SELECT, WITH, VALUES or EXPLAIN and contain no ";" other than an optional single trailing one — a ";" anywhere else, including inside a string literal, is rejected as multiple statements rather than parsed. The query runs wrapped as SELECT * FROM (<sql>) LIMIT <limit+1>, which also detects truncation. BLOB columns are not converted — use hex(col) or length(col), or the JSON output is garbage. A database with a real -wal journal next to it is read from a private, automatically cleaned-up copy rather than in place, so nothing is left beside the original file; wal_copy/wal_copy_ms in the response say whether that happened and how long it took.',
+    description: 'Run one read-only SQL statement on a SQLite file (sqlite3 -readonly -safe -json; ATTACH and other escapes are disabled). Must start with SELECT, WITH, VALUES, or EXPLAIN [QUERY PLAN] followed by one of those. Runs wrapped as SELECT * FROM (<sql>) LIMIT <limit+1>; truncated=true means more rows exist. ";" is allowed only inside string literals, quoted identifiers and comments, plus one trailing. Bind parameters (?, :x, @x, $x, #x) are rejected — write values as literals. EXPLAIN describes the wrapped statement. BLOBs are not converted — use hex(col) or length(col). A database with a -wal journal is read from a temporary copy (wal_copy in the response).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -611,7 +599,7 @@ async function callTool(name, args) {
     case 'read_file':
     case 'read_text_file': {
       const p = resolveSafe(args.path);
-      let text = fs.readFileSync(p, 'utf8');
+      let text = fs.readFileSync(p.path, 'utf8');
       // offset/limit is the only branch that changes the response shape, and it
       // is opt-in: head/tail and the plain read stay byte-identical to <=2.4.1.
       if (args.offset !== undefined || args.limit !== undefined) {
@@ -622,7 +610,7 @@ async function callTool(name, args) {
         const limit = args.limit === undefined ? lines.length : toInt(args.limit, 'limit');
         if (limit < 1) throw new Error('limit must be >= 1');
         const end = Math.min(lines.length, start + limit - 1);
-        const head = `${p} · rev ${revOf(text)} · lines ${start}-${end} of ${lines.length}`;
+        const head = `${p.path} · rev ${revOf(text)} · lines ${start}-${end} of ${lines.length}`;
         return [{ type: 'text', text: `${head}\n${lines.slice(start - 1, end).join('\n')}` }];
       }
       // head/tail must slice the same line array as everything else. Until
@@ -643,7 +631,7 @@ async function callTool(name, args) {
       try { new RegExp(args.pattern); }
       catch (e) { throw new Error(`invalid regex: ${e.message}`); }
       const job = {
-        root,
+        root: root.path,
         pattern: args.pattern,
         ignoreCase: args.ignore_case === true || args.ignore_case === 'true',
         include: args.include || null,
@@ -671,12 +659,12 @@ async function callTool(name, args) {
       const pageNum = hashIdx !== -1 ? parseInt(rawPath.slice(hashIdx + 1)) || 1 : 1;
       const cleanPath = hashIdx !== -1 ? rawPath.slice(0, hashIdx) : rawPath;
       const p = resolveSafe(cleanPath);
-      const ext = path.extname(p).toLowerCase();
+      const ext = path.extname(p.path).toLowerCase();
       if (ext === '.pdf') {
         const [totalPages, block] = await Promise.all([pdfPageCount(p), pdfPageToImage(p, pageNum)]);
         return [{ type: 'text', text: `Page ${pageNum} of ${totalPages}` }, block];
       }
-      const data = fs.readFileSync(p).toString('base64');
+      const data = fs.readFileSync(p.path).toString('base64');
       const mime = mimeType(ext);
       if (mime.startsWith('image/')) return [{ type: 'image', data, mimeType: mime }];
       if (mime.startsWith('audio/')) return [{ type: 'audio', data, mimeType: mime }];
@@ -694,7 +682,7 @@ async function callTool(name, args) {
 
     case 'read_pdf_text': {
       const p = resolveSafe(args.path);
-      if (path.extname(p).toLowerCase() !== '.pdf') throw new Error(`Not a PDF file: ${p}`);
+      if (path.extname(p.path).toLowerCase() !== '.pdf') throw new Error(`Not a PDF file: ${p.path}`);
       const total = await pdfPageCount(p);
       const first = args.first_page !== undefined ? parseInt(args.first_page) || 1 : 1;
       const last = args.last_page !== undefined ? parseInt(args.last_page) || total : total;
@@ -730,10 +718,10 @@ async function callTool(name, args) {
           const p = resolveSafe(fp);
           // Bulk reads must not scoop discarded versions back into context.
           // A single deliberate read_text_file still opens them.
-          const trash = P.trashDirOf(policyOfDir(path.dirname(p), memo));
-          if (trash && P.inside(p, trash))
+          const trash = P.trashDirOf(policyOfDir(parentDir(p), memo));
+          if (trash && P.inside(p.path, trash.path))
             throw new Error('this file is in the trash — bulk reads skip it; open it with read_text_file if you really want it');
-          results.push(`=== ${fp} ===\n${fs.readFileSync(p, 'utf8')}`);
+          results.push(`=== ${fp} ===\n${fs.readFileSync(p.path, 'utf8')}`);
         }
         catch (e) { results.push(`=== ${fp} ===\nERROR: ${e.message}`); }
       }
@@ -744,9 +732,11 @@ async function callTool(name, args) {
       const p = resolveSafe(args.path);
       const policy = guardWrite(p, memo, 'written');
       const existed = guardOverwrite(p, policy, args.rev, 'overwritten');
-      fs.mkdirSync(path.dirname(p), { recursive: true });
-      fs.writeFileSync(p, args.content, 'utf8');
-      return [{ type: 'text', text: `${existed ? 'Overwritten' : 'Written'}: ${p} · rev ${revOf(args.content)}` }];
+      // Both destinations are checked paths: p came from resolveSafe, its
+      // directory from parentDir (a resolveSafe of its own).
+      fs.mkdirSync(parentDir(p).path, { recursive: true });
+      fs.writeFileSync(p.path, args.content, 'utf8');
+      return [{ type: 'text', text: `${existed ? 'Overwritten' : 'Written'}: ${p.path} · rev ${revOf(args.content)}` }];
     }
 
     case 'edit_file': {
@@ -756,7 +746,7 @@ async function callTool(name, args) {
       // The policy is checked for a dry run too: better to learn that the zone
       // is locked before composing the edit than after.
       const policy = guardWrite(p, memo, 'edited');
-      let text = fs.readFileSync(p, 'utf8');
+      let text = fs.readFileSync(p.path, 'utf8');
       const rev0 = revOf(text);
       guardOverwrite(p, policy, args.rev, 'edited');
 
@@ -838,10 +828,10 @@ async function callTool(name, args) {
           lines.splice(e.s - 1, e.en - e.s + 1, ...insLines);
         }
         const out = joinLines(lines, eol);
-        if (!dry) fs.writeFileSync(p, out, 'utf8');
+        if (!dry) fs.writeFileSync(p.path, out, 'utf8');
         const rev1 = revOf(out);
         return [{ type: 'text', text:
-          `${dry ? '[DRY RUN] ' : ''}${norm.length} line edit(s) — ${p}\n` +
+          `${dry ? '[DRY RUN] ' : ''}${norm.length} line edit(s) — ${p.path}\n` +
           `lines ${before} → ${lines.length} · rev ${rev0} → ${rev1}` +
           (dry ? '\n\n' + preview.join('\n') : '') }];
       }
@@ -852,8 +842,8 @@ async function callTool(name, args) {
         if (!text.includes(edit.oldText)) throw new Error(`oldText not found: "${edit.oldText.slice(0, 60)}"`);
         text = text.replace(edit.oldText, edit.newText);
       }
-      if (!dry) fs.writeFileSync(p, text, 'utf8');
-      return [{ type: 'text', text: `${dry ? '[DRY RUN] ' : ''}${edits.length} edit(s) applied to ${p} · rev ${rev0} → ${revOf(text)}` }];
+      if (!dry) fs.writeFileSync(p.path, text, 'utf8');
+      return [{ type: 'text', text: `${dry ? '[DRY RUN] ' : ''}${edits.length} edit(s) applied to ${p.path} · rev ${rev0} → ${revOf(text)}` }];
     }
 
     case 'create_directory': {
@@ -862,22 +852,22 @@ async function callTool(name, args) {
       // .vault-policy is unreadable as a marker, so the zone fails closed and
       // cannot be repaired with these tools at all.
       guardWrite(p, memo, 'created');
-      fs.mkdirSync(p, { recursive: true });
-      return [{ type: 'text', text: `Created: ${p}` }];
+      fs.mkdirSync(p.path, { recursive: true });
+      return [{ type: 'text', text: `Created: ${p.path}` }];
     }
 
     case 'list_directory': {
       const p = resolveSafe(args.path);
       const policy = policyOfDir(p, memo);
       const notes = orphanTrashNote(p, policy);
-      return [{ type: 'text', text: [P.describePolicy(policy, p), ...notes, '', listDir(p)].join('\n') }];
+      return [{ type: 'text', text: [P.describePolicy(policy, p.path), ...notes, '', listDir(p)].join('\n') }];
     }
 
     case 'list_directory_with_sizes': {
       const p = resolveSafe(args.path);
       const policy = policyOfDir(p, memo);
       const notes = orphanTrashNote(p, policy);
-      return [{ type: 'text', text: [P.describePolicy(policy, p), ...notes, '', listDirWithSizes(p, args.sortBy)].join('\n') }];
+      return [{ type: 'text', text: [P.describePolicy(policy, p.path), ...notes, '', listDirWithSizes(p, args.sortBy)].join('\n') }];
     }
 
     case 'directory_tree': {
@@ -886,7 +876,7 @@ async function callTool(name, args) {
       const hidden = { n: 0 };
       const body = dirTree(p, memo, policy, 0, hidden);
       const foot = hidden.n ? `\n\n(${hidden.n} trash director${hidden.n === 1 ? 'y' : 'ies'} omitted — reach one by its explicit path)` : '';
-      return [{ type: 'text', text: `${P.describePolicy(policy, p)}\n\n${body}${foot}` }];
+      return [{ type: 'text', text: `${P.describePolicy(policy, p.path)}\n\n${body}${foot}` }];
     }
 
     case 'move_file': {
@@ -894,13 +884,13 @@ async function callTool(name, args) {
       const dst = resolveSafe(args.destination);
       assertNotMarker(src, 'moved');
       assertNotMarker(dst, 'created');
-      const st = fs.lstatSync(src);
+      const st = fs.lstatSync(src.path);
 
-      const srcDir = path.dirname(src);
+      const srcDir = parentDir(src);
       const srcPolicy = policyOfDir(srcDir, memo);
       if (srcPolicy.error) throw new Error(`Refused — ${srcPolicy.error}`);
       if (srcPolicy.readonly)
-        throw new Error(`Refused — ${srcDir} is read-only by policy (${P.describePolicy(srcPolicy, srcDir)}); nothing may leave it.`);
+        throw new Error(`Refused — ${srcDir.path} is read-only by policy (${P.describePolicy(srcPolicy, srcDir.path)}); nothing may leave it.`);
 
       const dstPolicy = guardWrite(dst, memo, 'written');
 
@@ -908,7 +898,7 @@ async function callTool(name, args) {
       // relative path. A hand-rolled move into the trash would produce a file
       // that the sweeper can never age out.
       const dstTrash = P.trashDirOf(dstPolicy);
-      if (dstTrash && P.inside(dst, dstTrash))
+      if (dstTrash && P.inside(dst.path, dstTrash.path))
         throw new Error(`Refused — do not move things into the trash by hand; use trash_file, which stamps the arrival time and preserves the relative path.`);
 
       if (st.isDirectory()) {
@@ -918,51 +908,58 @@ async function callTool(name, args) {
         guardTakeOut(src, srcPolicy, args.rev, 'moved');
       }
 
-      if (fs.existsSync(dst)) {
+      if (fs.existsSync(dst.path)) {
         if (dstPolicy.overwrite !== 'free')
-          throw new Error(`Refused — ${dst} already exists and the destination zone has policy "overwrite: ${dstPolicy.overwrite}". Discard the destination first (trash_file), then move.`);
+          throw new Error(`Refused — ${dst.path} already exists and the destination zone has policy "overwrite: ${dstPolicy.overwrite}". Discard the destination first (trash_file), then move.`);
         if (st.isDirectory())
-          throw new Error(`Refused — ${dst} already exists; a directory is not moved onto an existing path.`);
+          throw new Error(`Refused — ${dst.path} already exists; a directory is not moved onto an existing path.`);
       }
 
-      fs.renameSync(src, dst);
-      return [{ type: 'text', text: `Moved: ${src} → ${dst}` }];
+      // Destination: dst is resolveSafe'd for this exact path above.
+      fs.renameSync(src.path, dst.path);
+      return [{ type: 'text', text: `Moved: ${src.path} → ${dst.path}` }];
     }
 
     case 'trash_file': {
       const p = resolveSafe(args.path);
       assertNotMarker(p, 'discarded');
-      const st = fs.lstatSync(p);
+      const st = fs.lstatSync(p.path);
       if (st.isDirectory())
-        throw new Error(`${p} is a directory. Directories are not discarded as a unit — trash the files inside it one by one, then the empty directory can be moved if its zone allows it.`);
-      if (!st.isFile()) throw new Error(`${p} is not a regular file.`);
+        throw new Error(`${p.path} is a directory. Directories are not discarded as a unit — trash the files inside it one by one, then the empty directory can be moved if its zone allows it.`);
+      if (!st.isFile()) throw new Error(`${p.path} is not a regular file.`);
 
-      const dir = path.dirname(p);
+      const dir = parentDir(p);
       const policy = policyOfDir(dir, memo);
       if (policy.error) throw new Error(`Refused — ${policy.error}`);
       if (policy.readonly)
-        throw new Error(`Refused — ${dir} is read-only by policy; a trash in a read-only zone would be meaningless and is ignored. Nothing was moved.`);
+        throw new Error(`Refused — ${dir.path} is read-only by policy; a trash in a read-only zone would be meaningless and is ignored. Nothing was moved.`);
 
       const trashDir = P.trashDirOf(policy);
       if (!trashDir)
-        throw new Error(`Refused — no trash is configured for this zone (${P.describePolicy(policy, dir)}), so nothing can be discarded here. Turn the trash on for the zone on the add-on's "Vault policies" page.`);
-      if (P.inside(p, trashDir)) throw new Error(`${p} is already in the trash.`);
+        throw new Error(`Refused — no trash is configured for this zone (${P.describePolicy(policy, dir.path)}), so nothing can be discarded here. Turn the trash on for the zone on the add-on's "Vault policies" page.`);
+      if (P.inside(p.path, trashDir.path)) throw new Error(`${p.path} is already in the trash.`);
 
       guardTakeOut(p, policy, args.rev, 'discarded');
 
       // Relative to the directory that OWNS the trash, so wiki/system/foo.md
       // lands at wiki/.vault-trash/system/foo.md and stays identifiable.
-      const rel = path.relative(policy.trashOwner, p);
+      const rel = path.relative(policy.trashOwner.path, p.path);
       const stamp = P.stampNow();
-      let dest = path.join(trashDir, path.dirname(rel), P.stampName(path.basename(p), stamp));
-      for (let i = 1; fs.existsSync(dest); i++) {
-        dest = path.join(trashDir, path.dirname(rel), P.stampName(path.basename(p), `${stamp}-${i}`));
+      const destOf = n => path.join(trashDir.path, path.dirname(rel), P.stampName(path.basename(p.path), n));
+      let destPath = destOf(stamp);
+      for (let i = 1; fs.existsSync(destPath); i++) {
+        destPath = destOf(`${stamp}-${i}`);
         if (i > 50) throw new Error('cannot find a free name in the trash');
       }
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.renameSync(p, dest);
+      // The trash directory comes from a marker, not from a readdir, so the
+      // path above is only lexically inside the vault: on 2.7.3 a trash that
+      // was a symlink out of the vault moved the file clean out of it. The
+      // destination is checked for real before anything is created or moved.
+      const dest = resolveSafe(destPath);
+      fs.mkdirSync(parentDir(dest).path, { recursive: true });
+      fs.renameSync(p.path, dest.path);
       return [{ type: 'text', text:
-        `Discarded: ${p}\n→ ${dest}\n` +
+        `Discarded: ${p.path}\n→ ${dest.path}\n` +
         `Nothing was deleted — the file sits in the trash and is excluded from grep_files, search_files, directory_tree and read_multiple_files.` +
         (policy.retention_enabled ? ` Auto-purge is ON for this zone: it will be erased ${policy.retention_days} days after the timestamp in the name.` : '') }];
     }
@@ -974,11 +971,11 @@ async function callTool(name, args) {
       let hiddenTrash = 0;
       function walk(dir, policy) {
         const trash = P.trashDirOf(policy);
-        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        for (const e of fs.readdirSync(dir.path, { withFileTypes: true })) {
           if (exclude.some(ex => e.name.includes(ex))) continue;
-          const full = path.join(dir, e.name);
-          if (e.isDirectory() && trash && full === trash) { hiddenTrash++; continue; }
-          if (e.name.includes(args.pattern) || full.includes(args.pattern)) results.push(full);
+          const full = SP.child(dir, e.name);
+          if (e.isDirectory() && trash && full.path === trash.path) { hiddenTrash++; continue; }
+          if (e.name.includes(args.pattern) || full.path.includes(args.pattern)) results.push(full.path);
           if (e.isDirectory()) walk(full, P.applyMarker(policy, full, memo));
         }
       }
@@ -989,13 +986,13 @@ async function callTool(name, args) {
 
     case 'get_file_info': {
       const p = resolveSafe(args.path);
-      const s = fs.statSync(p);
-      const info = { path: p, size: s.size, isFile: s.isFile(), isDirectory: s.isDirectory(), created: s.birthtime, modified: s.mtime };
+      const s = fs.statSync(p.path);
+      const info = { path: p.path, size: s.size, isFile: s.isFile(), isDirectory: s.isDirectory(), created: s.birthtime, modified: s.mtime };
       // lines/rev only for text files small enough to hash cheaply; a binary or
       // a huge blob just gets the old field set.
       if (s.isFile() && s.size <= GREP_MAX_FILE) {
         try {
-          const buf = fs.readFileSync(p);
+          const buf = fs.readFileSync(p.path);
           if (!buf.subarray(0, 4096).includes(0)) {
             const text = buf.toString('utf8');
             info.lines = splitLines(stripBom(text)).lines.length;
@@ -1068,7 +1065,7 @@ const server = http.createServer(async (req, res) => {
   const accept = req.headers['accept'] || '';
   if (!accept.includes('application/json') && !accept.includes('text/event-stream')) {
     res.writeHead(406);
-    res.end(JSON.stringify({ error: 'Not Acceptable: Client must accept both application/json and text/event-stream' }));
+    res.end(JSON.stringify({ error: 'Not Acceptable: Client must accept application/json or text/event-stream' }));
     return;
   }
 
@@ -1116,5 +1113,5 @@ if (GREP_WORKER) {
   });
   // Trash sweep: off unless a zone opts in. Runs shortly after start and once
   // a day after that.
-  require('./retention').start(ALLOWED_DIR);
+  require('./retention').start(R.root);
 }

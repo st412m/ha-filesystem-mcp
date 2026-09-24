@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const SP = require('./safepath');
 
 const POLICY_FILE = '.vault-policy';
 const OVERWRITE_MODES = ['rev', 'never', 'free'];
@@ -108,7 +109,11 @@ function validTrashName(name) {
 // each touch hundreds of paths, and without it this would be O(N × depth)
 // reads. It is dropped when the call ends, so there is never a stale cache.
 function applyMarker(parent, dir, memo) {
-  const file = path.join(dir, POLICY_FILE);
+  const dirPath = SP.pathOf(dir, 'applyMarker');
+  // The marker sits in the directory itself, so it is a child of a path that
+  // has already been checked. memo is keyed by the string — a brand is a fresh
+  // object every time and would never hit the cache.
+  const file = SP.child(dir, POLICY_FILE).path;
   let text;
   if (memo && memo.has(file)) {
     text = memo.get(file);
@@ -135,36 +140,52 @@ function applyMarker(parent, dir, memo) {
   if ('trash' in m) { next.trash = m.trash; next.trashOwner = m.trash ? dir : null; }
   if ('retention_enabled' in m) next.retention_enabled = m.retention_enabled;
   if ('retention_days' in m) next.retention_days = m.retention_days;
-  next.source = dir;
+  // trashOwner is a brand: retention.js unlinks inside the trash built from it,
+  // so it has to carry the check with it. source is only ever printed or
+  // compared, so it stays a plain string.
+  next.source = dirPath;
   return next;
 }
 
 // Effective policy for a directory: root marker first, then every marker on the
-// way down. `dir` must already have passed containment (resolveSafe).
+// way down. Both ends arrive as brands, so containment is already settled; the
+// steps between them are rebuilt with child(), which refuses a `..` segment —
+// a dir that is not under root now fails closed instead of quietly reading
+// markers outside it.
 function policyForDir(dir, root, memo) {
-  const rel = path.relative(root, dir);
+  const dirPath = SP.pathOf(dir, 'policyForDir');
+  const rootPath = SP.pathOf(root, 'policyForDir');
+  const rel = path.relative(rootPath, dirPath);
   const segs = (rel === '' || rel === '.') ? [] : rel.split(path.sep).filter(Boolean);
   let cur = applyMarker(unrestricted(), root, memo);
   let p = root;
   for (const s of segs) {
-    p = path.join(p, s);
+    p = SP.child(p, s);
     cur = applyMarker(cur, p, memo);
   }
   return cur;
 }
 
-// For a file, the policy of the directory holding it.
+// For a file, the policy of the directory holding it. Going up is a full
+// resolveSafe (see safepath.parent), not a lexical dirname.
 function policyForPath(p, root, memo, isDir) {
-  return policyForDir(isDir ? p : path.dirname(p), root, memo);
+  SP.pathOf(p, 'policyForPath');
+  return policyForDir(isDir ? p : SP.parent(p), root, memo);
 }
 
+// A brand: retention.js reads and unlinks inside this directory. The name is
+// one segment — parseMarker puts every marker's `trash` through
+// validTrashName() — so child() is the right constructor. It is LEXICAL
+// though: a trash directory that is itself a symlink out of the vault is not
+// caught here, and anything that writes into it must resolveSafe the
+// destination first (see trash_file in server.js).
 function trashDirOf(policy) {
-  return (policy.trash && policy.trashOwner) ? path.join(policy.trashOwner, policy.trash) : null;
+  return (policy.trash && policy.trashOwner) ? SP.child(policy.trashOwner, policy.trash) : null;
 }
 
-function inside(p, root) {
-  return p === root || p.startsWith(root + path.sep);
-}
+// Re-exported from safepath so there is exactly one copy in the add-on;
+// policy-ui.js reaches it as P.inside. Strings in, no brand.
+const inside = SP.inside;
 
 // ---------------------------------------------------------------------------
 // Trash name stamping
@@ -202,6 +223,8 @@ function stampOf(name) {
 // ---------------------------------------------------------------------------
 // Human-readable policy line, printed by the listing tools
 // ---------------------------------------------------------------------------
+// Display only — it compares and prints, never touches the disk, so `dir` is a
+// plain string here and callers hand it `.path`.
 function describePolicy(policy, dir) {
   if (policy.error) return `⚠ Policy: BROKEN MARKER — zone locked (read-only, no deletion). ${policy.error}`;
   if (!policy.source) return 'Policy: none — unrestricted (no .vault-policy marker above this directory).';
@@ -209,7 +232,7 @@ function describePolicy(policy, dir) {
   const bits = [];
   bits.push(policy.readonly ? 'read-only' : `overwrite=${policy.overwrite}`);
   if (policy.trash) {
-    const own = policy.trashOwner === dir ? '' : ` in ${policy.trashOwner}`;
+    const own = policy.trashOwner.path === dir ? '' : ` in ${policy.trashOwner.path}`;
     bits.push(`trash=${policy.trash}${own}`);
   } else {
     bits.push('no trash (deletion not available)');
@@ -225,8 +248,13 @@ function describePolicy(policy, dir) {
 // Zone discovery — used by retention and by the policy page
 // ---------------------------------------------------------------------------
 // Directories only, bounded, never descends into a trash or into .git /
-// node_modules, and never follows a symlink.
+// node_modules, and never follows a symlink. `dirs` comes back as brands: the
+// callers (retention.js, the policy page) feed them straight back into
+// policyForDir, and the walk builds them with child() from an already-checked
+// root, which is exactly what child() is for. Anything printed or put in a
+// JSON response takes `.path`.
 function findMarkerDirs(root, memo, opts) {
+  SP.pathOf(root, 'findMarkerDirs');
   const o = Object.assign({ maxDepth: 8, maxDirs: 5000 }, opts || {});
   const found = [];
   let visited = 0;
@@ -235,16 +263,16 @@ function findMarkerDirs(root, memo, opts) {
   const walk = (dir, policy, depth) => {
     if (truncated) return;
     if (visited++ > o.maxDirs) { truncated = true; return; }
-    if (fs.existsSync(path.join(dir, POLICY_FILE))) found.push(dir);
+    if (fs.existsSync(SP.child(dir, POLICY_FILE).path)) found.push(dir);
     if (depth >= o.maxDepth) return;
     const trash = trashDirOf(policy);
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = fs.readdirSync(dir.path, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       if (!e.isDirectory()) continue;          // isDirectory() is false for symlinks
       if (SKIP_DIRS.has(e.name)) continue;
-      const full = path.join(dir, e.name);
-      if (trash && full === trash) continue;
+      const full = SP.child(dir, e.name);
+      if (trash && full.path === trash.path) continue;
       walk(full, applyMarker(policy, full, memo), depth + 1);
     }
   };

@@ -51,6 +51,15 @@ Set `log_requests: true`, restart the app and watch its log. Every request that 
 
 claude.ai connects from Anthropic's published egress range, `160.79.104.0/21`. Issue [#4](https://github.com/st412m/ha-filesystem-mcp/issues/4) shows a full investigation. Set the option back to `false` when done.
 
+## A path is refused
+
+The refusal starts with `PATH_OUTSIDE_VAULT` when the path is not inside `vault_path`. Every tool is affected, reading as well as writing, and nothing is read or written when it fires. The usual causes:
+
+- The path is simply somewhere else, or climbs out of the vault with `..`.
+- It is a sibling directory whose name starts with the vault's own — `/media/VAULT_backup` is not inside `/media/VAULT`.
+- Something on the way is a symlink leading out of the vault. This is checked against the resolved path, so a symlink that leaves the vault and points back into it is refused too, at the destination of the write.
+- `vault_path` itself is wrong, and the client is sending paths for the vault you meant. Check the option on the app's configuration tab.
+
 ## Writes are refused
 
 - `Refused — … is read-only by policy`: the zone is read-only. Change it on the **Vault policies** page.

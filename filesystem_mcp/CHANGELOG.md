@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.8.0 — 2026-09-24
+
+The check that a path is inside the vault now lives in one module and is verified by the modules behind it rather than assumed, zone refusals carry a code, `EXPLAIN` runs, and the SQL statement check is a tokenizer instead of a search for `;`.
+
+### Added
+- `safepath.js`: the one place a path is checked against the vault, handing back a verified path rather than a string.
+- `EXPLAIN` and `EXPLAIN QUERY PLAN` run in `sqlite_query`, with the modifier lifted outside the wrapper.
+- Refusal codes `MALFORMED_SQL` and `PARAMETERS_NOT_SUPPORTED`.
+
+### Changed
+- `policy.js`, `retention.js` and `sqlite.js` accept only a verified path and refuse a bare string before touching the disk.
+- Zone refusals now start with the `PATH_OUTSIDE_VAULT` code, a visible change in every file tool.
+- `trash_file` no longer carries a file out of the vault when the trash directory is a symlink pointing outside it: the destination is checked before the move.
+- A write through a directory symlink that leaves the vault and leads back into it is now refused; the zone is taken from the verified parent.
+- `create_directory` on the vault root itself is now refused.
+- The Vault policies page no longer counts the files in a trash directory that is a symlink.
+- `;` inside string literals, quoted identifiers and comments is accepted; bind parameters (`?`, `:x`, `@x`, `$x`, `#x`) are now rejected (previously they silently became NULL); unterminated literals and comments and unbalanced parentheses are rejected before `sqlite3` starts.
+- The 406 message describes the actual rule: either media type is enough, not both.
+- `test/make-fixtures.sh` resolves fixture paths against `VAULT_PATH`.
+- The build-time smoke test checks that `EXPLAIN` comes back as JSON.
+
 ## 2.7.3 — 2026-09-22
 
 Documentation split into a README and a `docs/` directory; build-time messages are now in English. Server behaviour is unchanged.

@@ -19,35 +19,20 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const P = require('./policy');
+const SP = require('./safepath');
 
 const VERSION = process.env.ADDON_VERSION || '0.0.0-dev';
-const ROOT = path.resolve(process.argv[2] || process.env.VAULT_PATH || '/media/VAULT');
 const PORT = parseInt(process.argv[3] || '3101', 10);
 const SUPERVISOR_IP = '172.30.32.2';
 // Local testing only (`ALLOW_LOCAL=true node policy-ui.js /tmp/vault`).
 const ALLOW_LOCAL = process.env.ALLOW_LOCAL === 'true';
 
-let REAL_ROOT = ROOT;
-try { REAL_ROOT = fs.realpathSync(ROOT); } catch {}
-
-function resolveSafe(p) {
-  if (typeof p !== 'string' || !p) throw new Error('path must be a non-empty string');
-  const resolved = path.resolve(p);
-  if (!P.inside(resolved, ROOT)) throw new Error(`Access denied: ${p}`);
-  let probe = resolved;
-  for (;;) {
-    try {
-      const real = fs.realpathSync(probe);
-      if (!P.inside(real, REAL_ROOT)) throw new Error(`Access denied (symlink escapes the vault): ${p}`);
-      return resolved;
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-      const parent = path.dirname(probe);
-      if (parent === probe || !P.inside(parent, ROOT)) throw new Error(`Access denied: ${p}`);
-      probe = parent;
-    }
-  }
-}
+// Until 2.7.3 this file carried its own byte-for-byte copy of resolveSafe.
+// Both copies now come from safepath.js; ROOT is the branded vault root, and
+// anything that leaves this process as JSON takes `.path`.
+const R = SP.createResolver(process.argv[2] || process.env.VAULT_PATH || '/media/VAULT');
+const resolveSafe = R.resolveSafe;
+const ROOT = R.root;
 
 function fromSupervisor(req) {
   const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
@@ -76,33 +61,52 @@ function writeMarker(dir, spec) {
   // written: a marker this page itself cannot parse would lock the zone.
   P.parseMarker(JSON.stringify(body));
 
-  const target = path.join(dir, P.POLICY_FILE);
-  const tmp = path.join(dir, `.vault-policy.tmp-${process.pid}-${Date.now()}`);
+  // Both destinations are re-checked rather than merely joined onto dir: this
+  // is the only place in the add-on that writes a marker, and a directory that
+  // turned into a symlink out of the vault between the tree scan and the save
+  // would otherwise be written to.
+  const target = resolveSafe(SP.child(dir, P.POLICY_FILE).path);
+  const tmp = resolveSafe(SP.child(dir, `.vault-policy.tmp-${process.pid}-${Date.now()}`).path);
   const text = JSON.stringify(body, null, 2) + '\n';
-  fs.writeFileSync(tmp, text, 'utf8');
-  try { fs.renameSync(tmp, target); }
-  catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
-  return target;
+  fs.writeFileSync(tmp.path, text, 'utf8');
+  try { fs.renameSync(tmp.path, target.path); }
+  catch (e) { try { fs.unlinkSync(tmp.path); } catch {} throw e; }
+  return target.path;
 }
 
+// unlink never follows the final symlink, so a marker that is one gets removed
+// rather than followed — the lexical path is enough here.
 function removeMarker(dir) {
-  const target = path.join(dir, P.POLICY_FILE);
-  try { fs.unlinkSync(target); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  return target;
+  const target = SP.child(dir, P.POLICY_FILE);
+  try { fs.unlinkSync(target.path); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  return target.path;
 }
 
 // ---------------------------------------------------------------------------
 // Tree: the root and what sits directly in it. One level, deliberately.
 // ---------------------------------------------------------------------------
 
+// Three outcomes, and the difference matters on the page. trashDirOf() is
+// lexical — the name comes from a marker, not from a readdir — so a trash that
+// is a symlink out of the vault would otherwise have someone else's directory
+// counted and shown as this zone's. Anything that is not a directory, symlink
+// included, therefore counts as unknown (null, rendered without a number),
+// same as a trash this zone does not own; the sweep refuses such a trash on
+// the same lstat. A trash that simply does not exist yet is not unknown: it is
+// created by the first trash_file, and until then it holds nothing, so it
+// counts 0 and the page keeps saying "trash (0)" as it did before 2.8.0.
 function countTrash(trashDir) {
+  let st;
+  try { st = fs.lstatSync(trashDir.path); }
+  catch (e) { return e.code === 'ENOENT' ? 0 : null; }
+  if (!st.isDirectory()) return null;
   let n = 0;
   const walk = (d, depth) => {
     if (depth > 6) return;
     let entries;
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    try { entries = fs.readdirSync(d.path, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      if (e.isDirectory()) walk(path.join(d, e.name), depth + 1);
+      if (e.isDirectory()) walk(SP.child(d, e.name), depth + 1);
       else if (e.isFile()) n++;
     }
   };
@@ -111,7 +115,7 @@ function countTrash(trashDir) {
 }
 
 function ownMarker(dir) {
-  try { return fs.lstatSync(path.join(dir, P.POLICY_FILE)).isFile(); } catch { return false; }
+  try { return fs.lstatSync(SP.child(dir, P.POLICY_FILE).path).isFile(); } catch { return false; }
 }
 
 function describeEntry(dir, memo) {
@@ -119,20 +123,20 @@ function describeEntry(dir, memo) {
   const own = ownMarker(dir);
   const trashDir = P.trashDirOf(policy);
   const out = {
-    path: dir,
-    name: dir === ROOT ? path.basename(ROOT) : path.basename(dir),
+    path: dir.path,
+    name: path.basename(dir.path),
     own,
     error: policy.error,
     mode: own ? modeOf(policy) : 'inherit',
     effective: modeOf(policy),
     trash: !!policy.trash,
     trashName: policy.trash || P.DEFAULT_TRASH,
-    trashOwn: trashDir ? policy.trashOwner === dir : false,
+    trashOwn: trashDir ? policy.trashOwner.path === dir.path : false,
     trashCount: null,
     retention_enabled: !!policy.retention_enabled,
     retention_days: policy.retention_days || 30,
     source: policy.source,
-    summary: P.describePolicy(policy, dir),
+    summary: P.describePolicy(policy, dir.path),
   };
   if (trashDir && out.trashOwn) out.trashCount = countTrash(trashDir);
   return out;
@@ -149,11 +153,11 @@ function buildTree() {
   const rootPolicy = P.policyForDir(ROOT, ROOT, memo);
   const rootTrash = P.trashDirOf(rootPolicy);
   const children = [];
-  for (const e of fs.readdirSync(ROOT, { withFileTypes: true })) {
+  for (const e of fs.readdirSync(ROOT.path, { withFileTypes: true })) {
     if (!e.isDirectory()) continue;
     if (P.SKIP_DIRS.has(e.name)) continue;
-    const full = path.join(ROOT, e.name);
-    if (rootTrash && full === rootTrash) continue;   // the trash is not a zone to configure
+    const full = SP.child(ROOT, e.name);
+    if (rootTrash && full.path === rootTrash.path) continue;   // the trash is not a zone to configure
     children.push(describeEntry(full, memo));
   }
   children.sort((a, b) => a.name.localeCompare(b.name));
@@ -161,14 +165,16 @@ function buildTree() {
   // Markers placed deeper than one level are not created here, but they must be
   // visible — somebody will drop one in by hand, and an invisible rule is worse
   // than a strict one. Directories only, bounded, no file walking.
+  // Keyed by string: scan.dirs holds brands, and two brands for the same
+  // directory are different objects.
   const scan = P.findMarkerDirs(ROOT, memo);
-  const shallow = new Set([ROOT, ...children.map(c => c.path)]);
-  const deeper = scan.dirs.filter(d => !shallow.has(d)).map(d => {
+  const shallow = new Set([ROOT.path, ...children.map(c => c.path)]);
+  const deeper = scan.dirs.filter(d => !shallow.has(d.path)).map(d => {
     const pol = P.policyForDir(d, ROOT, memo);
-    return { path: d, summary: P.describePolicy(pol, d), error: pol.error };
+    return { path: d.path, summary: P.describePolicy(pol, d.path), error: pol.error };
   });
 
-  return { root, children, deeper, truncated: scan.truncated, vault: ROOT, version: VERSION };
+  return { root, children, deeper, truncated: scan.truncated, vault: ROOT.path, version: VERSION };
 }
 
 // ---------------------------------------------------------------------------
@@ -179,8 +185,8 @@ function applyChange(body) {
   if (!body || typeof body.path !== 'string') throw new Error('path is required');
   const dir = resolveSafe(body.path);
   let st;
-  try { st = fs.lstatSync(dir); } catch { throw new Error(`${dir} does not exist`); }
-  if (!st.isDirectory()) throw new Error(`${dir} is not a directory`);
+  try { st = fs.lstatSync(dir.path); } catch { throw new Error(`${dir.path} does not exist`); }
+  if (!st.isDirectory()) throw new Error(`${dir.path} is not a directory`);
 
   if (body.mode === 'inherit') {
     const t = removeMarker(dir);
@@ -252,7 +258,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  process.stderr.write(`Vault policy page v${VERSION} on port ${PORT} (ingress), vault: ${ROOT}\n`);
+  process.stderr.write(`Vault policy page v${VERSION} on port ${PORT} (ingress), vault: ${ROOT.path}\n`);
 });
 
 // ---------------------------------------------------------------------------

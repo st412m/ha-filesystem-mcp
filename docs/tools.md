@@ -2,7 +2,7 @@
 
 Every tool the server offers, with its parameters and what it returns. Look here when you need an exact parameter name, a default, or the difference between two similar tools. The grouping matches the README.
 
-All paths are absolute paths inside `vault_path`. A path outside the vault, or one that resolves outside it through a symlink, is refused, and nothing is read or written. An error comes back as a normal tool result with `isError: true` and text starting with `Error: `.
+All paths are absolute paths inside `vault_path`. A path outside the vault is refused with the code `PATH_OUTSIDE_VAULT`, and nothing is read or written. That covers a path that simply points elsewhere, one that climbs out with `..`, one that reaches a sibling directory whose name merely starts with the vault's own, and one that resolves out through a symlink — including the case where the symlink leads back inside, which is checked at the destination of every write. An error comes back as a normal tool result with `isError: true` and text starting with `Error: `.
 
 ## Reading
 

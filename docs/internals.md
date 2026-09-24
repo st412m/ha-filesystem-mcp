@@ -41,7 +41,8 @@ The server speaks JSON-RPC over `POST /mcp` and answers with `Content-Type: appl
 | `filesystem_mcp/run.sh` | reads options, prints the banner, seeds the vault once, starts the three processes |
 | `filesystem_mcp/toolchain-check.sh` | `build`: major-version guard and smoke test of PDF and SQLite; `runtime`: version banner |
 | `filesystem_mcp/proxy.js` | token prefix, `/mcp` allow-list, `log_requests` |
-| `filesystem_mcp/server.js` | HTTP endpoint, JSON-RPC dispatch, the `TOOLS` array, `callTool()`, `resolveSafe()`, `rev`, the grep worker |
+| `filesystem_mcp/server.js` | HTTP endpoint, JSON-RPC dispatch, the `TOOLS` array, `callTool()`, `rev`, the grep worker |
+| `filesystem_mcp/safepath.js` | the vault boundary check: `resolveSafe()` and the verified-path type every other module demands |
 | `filesystem_mcp/policy.js` | reading and merging `.vault-policy` markers, trash stamps, the policy line printed by listing tools |
 | `filesystem_mcp/policy-ui.js` | the Vault policies page and the only code that writes markers |
 | `filesystem_mcp/retention.js` | the trash auto-purge sweep |
@@ -50,12 +51,20 @@ The server speaks JSON-RPC over `POST /mcp` and answers with `Content-Type: appl
 
 There are no npm dependencies. Everything uses Node's built-in modules and the `pdftotext`, `pdftoppm`, `pdfinfo` and `sqlite3` binaries, called with `execFile` and an argument array, never through a shell.
 
+### The vault boundary
+
+Since 2.8.0 the check that a path is inside the vault lives in exactly one module, `safepath.js`, and it is the only place that can produce a path the rest of the add-on will accept. Before that the same check existed as two identical copies, and the modules behind it — `policy.js`, `retention.js`, `sqlite.js` — took plain strings on the understanding that the caller had already checked them. That understanding was a comment, and testing walked straight past it: calling `sqlite.js` directly, without going through the server, read a file outside the vault.
+
+Now those modules accept only a path that came from the check, and refuse anything else before they touch the disk, with the code `UNVERIFIED_PATH`. That code is internal: it means one part of the add-on called another incorrectly. A client on `/mcp` cannot produce it, because every tool resolves its path arguments first; if you see it in the log, the bug is ours. A path from outside the vault is a different, user-visible refusal, `PATH_OUTSIDE_VAULT` (see [troubleshooting](troubleshooting.md#a-path-is-refused)).
+
+Two consequences worth knowing. Moving *down* from a checked directory — the step every tree walk takes, one name at a time from a directory listing — needs no new check, because those walks do not follow symlinks. Moving *up* does: the check verifies the real path of the path itself, not of its ancestors, so the parent of a checked path is re-checked in full. That is what makes a destination reached through a symlink out of the vault and back into it refusable — before 2.8.0 such a write was accepted and took its zone from the wrong place. Every destination of a write, a directory creation or a rename is now a path the check produced for that exact destination, including the name a file is given inside a trash directory.
+
 The add-on version has a single source: `version` in `config.yaml` → `BUILD_VERSION` build argument → `ADDON_VERSION` environment variable, read by `server.js`, `policy-ui.js` and `run.sh`.
 
 ## Adding a tool
 
 1. Add an entry to the `TOOLS` array in `server.js`: `name`, a short `description`, and `inputSchema`. Everything in `TOOLS` is sent to the client with `tools/list` in every session, so keep descriptions short.
-2. Add a `case` to `callTool()`. Pass every path argument through `resolveSafe()` first. For anything that writes, call `guardWrite()` and, for an existing target, `guardOverwrite()`.
+2. Add a `case` to `callTool()`. Pass every path argument through `resolveSafe()` first, and hand the result to `fs` as `.path` at the call itself — a bare string will be refused by the modules behind it. For anything that writes, call `guardWrite()` and, for an existing target, `guardOverwrite()`; if the destination is built rather than resolved, resolve it before writing.
 3. Return an array of MCP content blocks (`{ type: 'text', text }`, `image` or `audio`). Throw to report an error; the dispatcher turns it into `isError: true`.
 4. If the tool lives in a new file, add a `COPY` line for it to the Dockerfile.
 5. Document it in the README's Tools list and in [tools.md](tools.md), add a changelog entry, and bump `version` in `config.yaml`.

@@ -97,7 +97,7 @@ claude.ai reaches the server from the internet, so port 3100 must be published t
 
 **SQLite (read-only)**
 - `sqlite_schema` — DDL of every object, file pragmas, optional per-table row counts
-- `sqlite_query` — one `SELECT`/`WITH`/`VALUES` statement, with a row limit
+- `sqlite_query` — one `SELECT`/`WITH`/`VALUES`/`EXPLAIN` statement, with a row limit
 
 The three listing tools print the write policy in force on every call. Policies are optional and set from the **Vault policies** page in the Home Assistant sidebar — see [docs/policies.md](docs/policies.md). The search-then-edit workflow is in [docs/search-and-edit.md](docs/search-and-edit.md), SQLite in [docs/sqlite.md](docs/sqlite.md).
 
@@ -123,7 +123,7 @@ Details are in [docs/troubleshooting.md](docs/troubleshooting.md).
 ## Security
 
 - The path prefix is the password. Use a random UUID, never the default `changeme`, and put TLS in front of port 3100.
-- Every path is confined to `vault_path`: a path outside it, a symlink pointing out of it, or a sibling directory sharing its name prefix is refused, and nothing is read or written.
+- Every path is confined to `vault_path`: a path outside it, a symlink pointing out of it, or a sibling directory sharing its name prefix is refused with `PATH_OUTSIDE_VAULT`, and nothing is read or written.
 - The auth proxy forwards only `/mcp`. Every other path answers 404 before it reaches the server.
 - The Vault policies page is a separate process on internal port 3101, reachable only through Home Assistant ingress. It accepts connections from the Supervisor address `172.30.32.2` only and cannot be reached through the token URL.
 - `grep_files` runs in a child process that is killed after 10 seconds, so a runaway regex cannot hang the server.
