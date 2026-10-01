@@ -1,19 +1,12 @@
 #!/bin/sh
-# Проверка тулчейна аддона. Запускается ДВАЖДЫ:
-#   /toolchain-check.sh build    — на сборке образа: падает, если версии ушли
-#                                  или если PDF-конвейер не работает
-#   /toolchain-check.sh runtime  — на старте: печатает баннер версий в лог
-#
-# Зачем: версии тулчейна должны быть видны в логе с первой секунды, а
-# нерабочий конвейер — ловиться на сборке, а не в бою (урок ha-adb-mcp
-# 0.3.3-0.3.5, 21.07.2026: три релиза подряд сломаны поведением внешних
-# утилит, диагностика шла вслепую).
+# Toolchain check of the add-on. Runs twice:
+#   /toolchain-check.sh build    - at image build: fails if a major version
+#                                  changed or the PDF or SQLite pipeline fails
+#   /toolchain-check.sh runtime  - at start: prints the version banner to the log
 set -eu
 
-# Ожидаемые мажоры (Alpine 3.22-stable на 2026-07-21:
-# nodejs 22.23.0-r0 (main), poppler 25.04.0-r0 (main, -utils сабпакет);
-# Alpine 3.22 main на 2025-07-20: sqlite 3.49.2-r1).
-# Патчи внутри ветки допустимы, смена мажора — нет.
+# Expected major versions. Patch releases within the Alpine branch are fine;
+# a different major stops the build.
 EXPECT_NODE_MAJOR=22
 EXPECT_POPPLER_MAJOR=25
 EXPECT_SQLITE_MAJOR=3
@@ -50,10 +43,10 @@ guard() {
   fi
 }
 
-# Смоук ровно того, чем работает сервер: pdfinfo (pdfPageCount),
-# pdftoppm с боевыми флагами (read_pdf_page/read_media_file),
-# pdftotext -layout (read_pdf_text). PDF генерируется на месте — валидный
-# однострочный документ с маркером, офсеты xref посчитаны заранее.
+# Smoke test of exactly what the server runs: pdfinfo (pdfPageCount),
+# pdftoppm with the server's flags (read_pdf_page, read_media_file) and
+# pdftotext -layout (read_pdf_text). The PDF is generated here: a valid
+# one-line document with a marker, xref offsets precomputed.
 smoke() {
   T=$(mktemp -d)
   # shellcheck disable=SC2064
@@ -94,14 +87,14 @@ startxref
 %%EOF
 PDF_EOF
 
-  # pdfinfo: сервер парсит строку "Pages:" в pdfPageCount()
+  # pdfinfo: the server parses the "Pages:" line in pdfPageCount()
   pdfinfo "$T/smoke.pdf" | grep -Eq '^Pages:[[:space:]]+1$' \
     || { echo "SMOKE FAIL: pdfinfo did not report Pages: 1" >&2; exit 1; }
 
-  # pdftoppm: РОВНО те флаги, что в server.js pdfPageToImage(). stderr глушится:
-  # в образе нет шрифтов, poppler пишет "Couldn't find a font for 'Helvetica'"
-  # и всё равно рендерит (заменяет её); сборку это не ломает — ниже уже
-  # проверяются код выхода, наличие файла и его JPEG-заголовок.
+  # pdftoppm: exactly the flags of pdfPageToImage() in server.js. stderr is
+  # discarded: the image has no fonts, so poppler warns that it cannot find
+  # Helvetica and renders with a substitute. Exit code, file and JPEG header
+  # are checked below.
   pdftoppm -jpeg -r 120 -scale-to 1400 -f 1 -l 1 "$T/smoke.pdf" "$T/page" 2>/dev/null \
     || { echo "SMOKE FAIL: pdftoppm failed" >&2; exit 1; }
   J=$(ls "$T"/page*.jpg 2>/dev/null | head -1)
@@ -109,47 +102,36 @@ PDF_EOF
   head -c 2 "$J" | od -An -tx1 | tr -d ' \n' | grep -qi 'ffd8' \
     || { echo "SMOKE FAIL: pdftoppm output is not a JPEG" >&2; exit 1; }
 
-  # pdftotext: РОВНО те флаги, что в server.js pdfToText()
+  # pdftotext: exactly the flags of pdfToText() in server.js
   pdftotext -layout -f 1 -l 1 "$T/smoke.pdf" - | grep -q 'VMCP-SMOKE-OK' \
     || { echo "SMOKE FAIL: pdftotext did not extract the marker" >&2; exit 1; }
 
-  # sqlite3: та же командная строка, что sqlite.js использует в runSqlite() —
-  # включая -cmd "PRAGMA hard_heap_limit=...", добавленный в 2.7.1.
+  # sqlite3: the command line runSqlite() in sqlite.js uses, including
+  # -cmd "PRAGMA hard_heap_limit=...".
   sqlite3 "$T/smoke.db" "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);" \
     || { echo "SMOKE FAIL: could not create the test database" >&2; exit 1; }
   HHL_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -readonly -safe -json "$T/smoke.db" "SELECT COUNT(*) AS n FROM t")
-  # Эхо прагмы — единственное место, где на каждом вызове видно, что ЭТА
-  # сборка sqlite3 действительно приняла лимит: незнакомое имя PRAGMA обычно
-  # молча ничего не делает, поэтому без этой проверки апдейт Alpine, тихо
-  # уронивший поддержку hard_heap_limit, не дал бы вообще никакого симптома —
-  # до первого настоящего OOM, который положит весь процесс аддона.
-  #
-  # Форма эха не закреплена железно: этот же смоук на реальной сборке уже
-  # один раз вернул голое "268435456" там, где sqlite.js параллельно видел
-  # "[{\"hard_heap_limit\":268435456}]" — при внешне идентичной командной
-  # строке (сравнивали байт в байт, разницы не нашли). Значение то же самое,
-  # сериализация — нет; причина не установлена, гоняться за ней дальше не
-  # стали. Проверяется поэтому именно значение, а не одна конкретная форма —
-  # ровно то же самое исправление, что и в sqlite.js (see HEAP_LIMIT_ECHO_CANDIDATES).
+  # The pragma echo is the only sign that this sqlite3 build accepted the
+  # limit: an unknown PRAGMA name does nothing, silently. The echo comes back
+  # either as JSON or as the bare number, so the value is checked, not one
+  # form (same as HEAP_LIMIT_ECHO_CANDIDATES in sqlite.js).
   echo "$HHL_OUT" | grep -Eq '^(\[\{"hard_heap_limit":268435456\}\]|268435456([^0-9]|$))' \
     || { echo "SMOKE FAIL: hard_heap_limit not confirmed by the pragma echo (got: $HHL_OUT)" >&2; exit 1; }
   echo "$HHL_OUT" | grep -q '"n":3' \
     || { echo "SMOKE FAIL: sqlite3 -readonly -safe -json did not return the expected COUNT(*)" >&2; exit 1; }
 
-  # EXPLAIN, through the same argv sqlite.js uses, including the -cmd
-  # ".explain off" added in 2.8.0. Without that flag the CLI ignores -json for
-  # EXPLAIN and EXPLAIN QUERY PLAN and draws a fixed-column text table instead,
-  # which sqlite.js can only report as MALFORMED_OUTPUT. A dot-command that
-  # -safe refuses does not change the exit status, so the output itself is what
-  # is checked: one line that both opens the JSON array and carries a quoted
-  # column name. The drawn table has the word opcode in it too, but never in
-  # quotes, and the pragma echo never mentions it at all.
+  # EXPLAIN, through the argv sqlite.js uses, including -cmd ".explain off".
+  # Without it the CLI ignores -json for EXPLAIN and EXPLAIN QUERY PLAN and
+  # draws a fixed-column text table, which sqlite.js reports as
+  # MALFORMED_OUTPUT. A dot-command refused by -safe does not change the exit
+  # status, so the output is checked: one line that opens the JSON array and
+  # carries a quoted column name.
   EXP_OUT=$(sqlite3 -cmd "PRAGMA hard_heap_limit=268435456;" -cmd ".explain off" -readonly -safe -json "$T/smoke.db" "EXPLAIN SELECT 1 AS x")
   echo "$EXP_OUT" | grep -q '^\[{.*"opcode"' \
     || { echo "SMOKE FAIL: EXPLAIN did not come back as JSON — .explain off had no effect (got: $(echo "$EXP_OUT" | head -3 | tr '\n' ' '))" >&2; exit 1; }
 
-  # -safe должна отбивать ATTACH — без этого запрос читает любой файл на
-  # диске в обход проверки зон (см. sqlite-spec.md). Успешный ATTACH — провал.
+  # -safe must refuse ATTACH; otherwise a query could read any file on the
+  # disk past the vault check. A successful ATTACH fails the build.
   if sqlite3 -readonly -safe "$T/smoke.db" "ATTACH '/etc/passwd' AS x;" >/dev/null 2>&1; then
     echo "SMOKE FAIL: -safe did not block ATTACH" >&2; exit 1
   fi

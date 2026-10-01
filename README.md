@@ -19,7 +19,7 @@ Authorization is a secret path prefix, `/private_<token>`, because claude.ai cus
 
 ## Installation
 
-Home Assistant renamed *add-ons* to *apps* in 2026.2; on older versions the same menus say *Add-ons* and *Add-on Store*.
+From Home Assistant 2026.2 the menus say *Apps* and *App Store*; older versions say *Add-ons* and *Add-on Store*.
 
 **1. Add this repository**
 
@@ -27,7 +27,7 @@ Home Assistant renamed *add-ons* to *apps* in 2026.2; on older versions the same
 
 Or by hand: **Settings → Apps → App Store → ⋮ → Repositories → + Add**, paste `https://github.com/st412m/ha-filesystem-mcp`, select **Add**.
 
-*If the badge opens the App Store but no dialog appears, that is [my.home-assistant.io#698](https://github.com/home-assistant/my.home-assistant.io/issues/698) — use the manual path.*
+*If the badge opens the App Store but no dialog appears, use the manual path.*
 
 **2. Install and configure**
 
@@ -44,11 +44,13 @@ Select **Start**. On a fresh install the app creates a starter `CLAUDE.md`, `log
 | `token` | `changeme` | Secret in the URL path. Change it before exposing the port. |
 | `vault_path` | `/media/VAULT` | The one directory the server may touch — anywhere under `/media` or `/share`. |
 | `log_requests` | `false` | Log one line per incoming request (token masked) for debugging connectors. |
+| `policy_page_users` | `[]` | Home Assistant users allowed to open the Vault policies page, by user name or user ID. Empty: every Home Assistant user. |
 
 ```yaml
 token: "your-uuid-here"
 vault_path: "/media/VAULT"
 log_requests: false
+policy_page_users: []
 ```
 
 Choosing and preparing the vault location, the first-run skeleton and request logging are covered in [docs/configuration.md](docs/configuration.md).
@@ -115,7 +117,7 @@ The three listing tools print the write policy in force on every call. Policies 
 
 - **The client shows old tools or old parameters after an update.** Refresh the connector's tool list and start a new chat. The tell for a stale schema is `write_file` without a `rev` parameter.
 - **claude.ai shows no tools, but `curl` works.** Set `log_requests: true`, restart, and watch the log during registration. If no requests arrive, look upstream at the proxy or tunnel.
-- **401 / 404 / 405 / 406.** 401 means a wrong token prefix, 404 a path other than `/mcp`, 405 a method other than `POST`, and 406 an `Accept` header without `application/json` or `text/event-stream`.
+- **400 / 401 / 404 / 405 / 406.** 400 means invalid JSON or an unsupported `MCP-Protocol-Version` header, 401 a wrong token prefix, 404 a path other than `/mcp`, 405 a method other than `POST`, and 406 an `Accept` header that is empty or lists none of `application/json`, `text/event-stream`, `application/*`, `*/*`.
 - **Every write is refused and the listing tools print `⚠ Policy: BROKEN MARKER`.** A `.vault-policy` file is unreadable and locks its zone. Fix it from the Vault policies page first.
 
 Details are in [docs/troubleshooting.md](docs/troubleshooting.md).
@@ -125,7 +127,7 @@ Details are in [docs/troubleshooting.md](docs/troubleshooting.md).
 - The path prefix is the password. Use a random UUID, never the default `changeme`, and put TLS in front of port 3100.
 - Every path is confined to `vault_path`: a path outside it, a symlink pointing out of it, or a sibling directory sharing its name prefix is refused with `PATH_OUTSIDE_VAULT`, and nothing is read or written.
 - The auth proxy forwards only `/mcp`. Every other path answers 404 before it reaches the server.
-- The Vault policies page is a separate process on internal port 3101, reachable only through Home Assistant ingress. It accepts connections from the Supervisor address `172.30.32.2` only and cannot be reached through the token URL.
+- The Vault policies page is a separate process on internal port 3101, reachable only through Home Assistant ingress. It accepts connections from the Supervisor address `172.30.32.2` only and cannot be reached through the token URL. Home Assistant shows the Vault policies entry in the sidebar to administrators only, but serves the page itself to any logged-in user who opens its address. To restrict the page, list your user name (Settings → People → Users; the Users tab is shown only with Advanced mode turned on in your user profile) in `policy_page_users`; any other user gets 403. With an empty list the page is open to every Home Assistant user, and the app log says so at start.
 - `grep_files` runs in a child process that is killed after 10 seconds, so a runaway regex cannot hang the server.
 - SQLite runs as `sqlite3 -readonly -safe`: `ATTACH` and the other ways out of the vault through SQL are disabled.
 

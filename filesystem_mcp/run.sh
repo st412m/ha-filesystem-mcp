@@ -6,10 +6,13 @@ export VAULT_TOKEN="${TOKEN}"
 export VAULT_PATH="${VAULT_PATH}"
 LOG_REQUESTS=$(bashio::config 'log_requests' 2>/dev/null || echo "false")
 export LOG_REQUESTS="${LOG_REQUESTS}"
+# One user name or ID per line; empty when the list is empty.
+POLICY_PAGE_USERS=$(bashio::config 'policy_page_users' 2>/dev/null || true)
+if [ "${POLICY_PAGE_USERS}" = "null" ]; then POLICY_PAGE_USERS=""; fi
+export POLICY_PAGE_USERS="${POLICY_PAGE_USERS}"
 
-# Версии внешних утилит в логе с первой секунды + манифест сборки (версии и
-# результат смоука PDF-конвейера). Файл лежит в образе, но шелла в контейнер
-# нет — без этой строки прочитать его снаружи нечем.
+# Toolchain versions and the build manifest (versions and smoke test result)
+# go to the log at start: the container has no shell to read /toolchain.txt.
 bashio::log.info "Toolchain: $(/toolchain-check.sh runtime)"
 if [ -f /toolchain.txt ]; then
     bashio::log.info "Build manifest: $(tr '\n' ';' < /toolchain.txt | sed 's/;/; /g')"
@@ -17,19 +20,10 @@ fi
 
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
-# ---------------------------------------------------------------------------
-# Разметка каталогов — РОВНО ОДИН РАЗ за жизнь установки (2.6.0).
-#
-# До 2.6.0 шесть `mkdir -p` выполнялись при каждом старте: охрана стояла на
-# файлах (CLAUDE.md, log.md создавались только при отсутствии) и не стояла на
-# каталогах, поэтому удалённый каталог молча воскресал после ближайшего
-# рестарта аддона. Теперь решает флаг в /data — он переживает рестарт
-# контейнера, но не переустановку аддона.
-#
-# Отдельная ветка для тех, кто обновляется: флага ещё нет, но вика уже живёт
-# (есть CLAUDE.md) — каталоги не трогаем вообще, просто ставим флаг. Иначе при
-# первом старте 2.6.0 удалённые каталоги воскресли бы в последний раз.
-# ---------------------------------------------------------------------------
+# The vault skeleton is created once per installation, guarded by a flag in
+# /data that survives a container restart but not a reinstall. A vault that
+# already has CLAUDE.md is never seeded: the flag is just set, and a
+# directory deleted later stays deleted.
 INIT_FLAG="/data/.vault-structure-initialized"
 
 if [ -f "${INIT_FLAG}" ]; then

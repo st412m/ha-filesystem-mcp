@@ -90,7 +90,7 @@ Every error starts with a code:
 | `SQLITE_MISSING` | the `sqlite3` binary is not installed |
 | `SQLITE_ERROR` | any other error from `sqlite3`, with its message |
 
-The five statement checks — `DOT_COMMAND`, `MALFORMED_SQL`, `PARAMETERS_NOT_SUPPORTED`, `MULTIPLE_STATEMENTS`, `INVALID_STATEMENT` — all run before `sqlite3` is started. When a statement is wrong in more than one way the answer is picked by seriousness, not by position, in exactly that order. A statement whose parentheses do not balance and which also carries a stray `;` is reported as malformed, which is the more useful of the two things to be told.
+The five statement checks — `DOT_COMMAND`, `MALFORMED_SQL`, `PARAMETERS_NOT_SUPPORTED`, `MULTIPLE_STATEMENTS`, `INVALID_STATEMENT` — all run before `sqlite3` is started. When a statement is wrong in more than one way the answer is picked by seriousness, not by position, in exactly that order. A statement whose parentheses do not balance and which also carries a stray `;` is reported as malformed.
 
 Where the tokenizer and SQLite could disagree, it refuses rather than accepts: `/*` as the last two characters of a query is division to SQLite and an unterminated comment here.
 

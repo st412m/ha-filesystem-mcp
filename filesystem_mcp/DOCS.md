@@ -8,7 +8,8 @@ An MCP server over Streamable HTTP that gives an assistant read and write access
 |---|---|---|
 | `token` | `changeme` | Secret in the URL path. Change it before exposing the port. |
 | `vault_path` | `/media/VAULT` | The one directory the server may touch, under `/media` or `/share`. |
-| `log_requests` | `false` | Log every request (method, path with the token masked, status, bytes, user agent). |
+| `log_requests` | `false` | Log every request (method, path with the token masked, status, bytes, `MCP-Protocol-Version` header, user agent). |
+| `policy_page_users` | `[]` | Home Assistant users allowed to open the Vault policies page, by user name or user ID. Empty: every Home Assistant user. |
 
 Restart the app after changing an option.
 
@@ -62,7 +63,7 @@ More: [tools](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/tools.m
 
 ## If the tool list looks wrong
 
-After an update, a client may keep offering the tools and parameters it fetched earlier. Refresh the connector's tool list in the client, then start a new chat. The quick test is `write_file`: if it has no `rev` parameter, the client holds a schema from before 2.6.0. Do not go by the number of tools; it changes between releases.
+After an update, a client may keep offering the tools and parameters it fetched earlier. Refresh the connector's tool list in the client, then start a new chat. The quick test is `write_file`: if it has no `rev` parameter, the client holds an outdated schema. Do not go by the number of tools; it changes between releases.
 
 More: [troubleshooting](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/troubleshooting.md).
 
@@ -81,6 +82,8 @@ More: [sqlite](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/sqlite
 ## Security
 
 Anyone holding the token URL has full access to the vault, so treat it as a password and put TLS in front of the port if it leaves the LAN. The proxy passes only `/mcp` through. The Vault policies page runs as a separate process on an internal port, reachable only through Home Assistant ingress, never through the token URL.
+
+Home Assistant shows the Vault policies entry in the sidebar to administrators only, but serves the page itself to any logged-in user who opens its address. To restrict the page, list your user name (Settings → People → Users; the Users tab is shown only with Advanced mode turned on in your user profile) in `policy_page_users`; any other user gets 403. With an empty list the page is open to every Home Assistant user, and the app log says so at start.
 
 ## Links
 

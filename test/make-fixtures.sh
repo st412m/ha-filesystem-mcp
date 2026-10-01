@@ -1,27 +1,18 @@
 #!/bin/sh
 # Builds throwaway test databases for sqlite_schema / sqlite_query
-# (filesystem_mcp/sqlite.js). Output is regenerated on every run — nothing
-# here is committed, these are binaries that would just rot in the repo.
+# (filesystem_mcp/sqlite.js). Output is regenerated on every run and is not
+# committed.
 #
-# Needs a real `sqlite3` on PATH. No FIFO, no other POSIX-only plumbing — a
-# plain pipe with a trailing `sleep` keeps the writer's stdin open, which
-# works the same on Linux, macOS and Git-Bash/MSYS on Windows.
+# Needs sqlite3 and node on PATH. Plain sh: runs on Linux, macOS and
+# Git-Bash/MSYS on Windows.
 #
-# /media/VAULT is one particular vault_path, not a constant of this add-on —
-# anyone else's vault lives somewhere else (a tester's was on a Raspberry Pi,
-# under a different mount entirely). VAULT_PATH is required, not defaulted:
+# VAULT_PATH is required. The self-checks below read the fixtures through the
+# vault check, so the output directory must be inside the vault.
 #
 #   VAULT_PATH=/media/VAULT test/make-fixtures.sh
 #   VAULT_PATH=/share/vault test/make-fixtures.sh /share/vault/tmp/fixtures
 #
 # Usage: test/make-fixtures.sh [output-dir]   (default: $VAULT_PATH/tmp/fixtures)
-#
-# 2.7.2: converted from bash to plain sh (the add-on image has no bash; every
-# prior run of this script started with `apk add bash` by hand first). No
-# bashism survived that couldn't be dropped without losing meaning — the only
-# one removed is `pipefail`, and nothing here relies on it: every pipe below
-# ends in the command whose exit status actually matters, which plain `set -e`
-# already catches.
 
 set -eu
 
@@ -97,23 +88,16 @@ printf 'this is not a sqlite database\n' > "$OUT/notsqlite.db"
 rm -f "$OUT/real.fydb"
 sqlite3 "$OUT/real.fydb" "CREATE TABLE t(x); INSERT INTO t VALUES (1), (2);"
 
-# --- bluecoins_schema.db: a real-world DDL dump (schema only, no data), ------
-# built from a Bluecoins backup a tester sent in. Covers three things no other
-# fixture does:
-#   1. Block comments inside CREATE TABLE — sqlite_master.sql is returned raw
-#      in sqlite_schema, so these land in the JSON response verbatim; this
-#      checks the response still assembles as valid JSON, not that we do
-#      anything to the comments (we don't touch them at all).
-#   2. sqlite_sequence, created by SQLite itself for an AUTOINCREMENT column —
-#      exercises the 'sqlite\_%' exclusion filter and the counts:true skip for
-#      real for the first time; every other fixture happens to have no
-#      AUTOINCREMENT table, so this branch has run zero times before it.
-#   3. Table names in upper case and already quoted in the source DDL — a
-#      different path through quoteIdent() than idents.db's spaces/reserved
-#      words.
-# The source file is not generated here — it is a real schema, dropped in by
-# hand at $VAULT_PATH/tmp/bluecoins-schema.sql. Missing input is not "skip
-# this fixture", it is "fail the run", same as every other fixture here.
+# --- bluecoins_schema.db: a real-world DDL dump (schema only, no data) -----
+# Covers three things no other fixture does:
+#   1. Block comments inside CREATE TABLE: sqlite_master.sql is returned raw
+#      by sqlite_schema, and the response must still be valid JSON.
+#   2. sqlite_sequence, created by SQLite for an AUTOINCREMENT column: the
+#      'sqlite_%' exclusion filter and the counts:true skip.
+#   3. Upper-case table names already quoted in the source DDL: a different
+#      path through quoteIdent() than idents.db's spaces and reserved words.
+# The source is not generated: put the schema dump at
+# $VAULT_PATH/tmp/bluecoins-schema.sql. A missing source fails the run.
 SRC="$VAULT_PATH/tmp/bluecoins-schema.sql"
 rm -f "$OUT/bluecoins_schema.db"
 if [ ! -f "$SRC" ]; then
@@ -127,25 +111,16 @@ TABLE_COUNT=$(sqlite3 "$OUT/bluecoins_schema.db" "SELECT COUNT(*) FROM sqlite_ma
   || { echo "make-fixtures: FATAL — bluecoins_schema.db has no tables after loading $SRC" >&2; exit 1; }
 
 # --- wal_hotcopy.db(+-wal) / wal_hotcopy_nowal.db: a hot copy of a live -
-# WAL-mode database. What this proves: a copy taken while the writer still
-# holds its connection open (.db + .db-wal together) reads back correctly
-# under -readonly -safe, because sqlite3 is allowed to create the -shm file
-# itself as long as the containing directory is writable (sqlite.org/wal.html)
-# — which it normally is. It does NOT reproduce WAL_PRESENT_READONLY: that
-# needs the directory itself to deny write access (a read-only bind-mount, a
-# share mounted without write permission, a full volume) — not reproducible
-# synthetically, and not under root, which ignores Unix permission bits. See
-# the matching note in sqlite.js; that branch has no fixture here.
+# WAL-mode database: the .db and its -wal copied while the writer still holds
+# its connection open. It reads back under -readonly -safe, because sqlite3
+# may create the -shm file itself in a writable directory
+# (sqlite.org/wal.html). It does not reproduce WAL_PRESENT_READONLY, which
+# needs a directory without write access; that branch has no fixture.
 #
-# Reproduction: set journal_mode=WAL, write rows, copy the .db together with
-# its -wal WHILE the writing connection is still open — closing it first lets
-# SQLite auto-checkpoint (checkpoint-on-last-close, independent of
-# wal_autocheckpoint) and fold the WAL back into the main file, leaving
-# nothing to copy. The trailing `sleep 5` inside the pipe subshell is what
-# keeps stdin open: sqlite3 has already executed the three statements above
-# it, but doesn't see EOF (and so doesn't close the connection) until the
-# subshell itself exits five seconds later. We copy the files during that
-# window.
+# Closing the connection would checkpoint the WAL into the main file and
+# leave nothing to copy. The `sleep 5` inside the pipe keeps the stdin of
+# sqlite3 open, so it does not see EOF and close the connection until five
+# seconds later; the files are copied in that window.
 rm -f "$OUT/wal_hotcopy.db" "$OUT/wal_hotcopy.db-wal" "$OUT/wal_hotcopy_nowal.db"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -159,56 +134,42 @@ SQL
   sleep 5
 } | sqlite3 "$WORK/live.db" &
 HOLDER_PID=$!
-sleep 2   # let sqlite3 finish executing before we read its files
+sleep 2   # let sqlite3 finish executing before its files are read
 
 if [ ! -f "$WORK/live.db-wal" ]; then
   echo "make-fixtures: WARN — no -wal sidecar appeared; wal_hotcopy fixture was not produced." >&2
   wait "$HOLDER_PID" 2>/dev/null || true
-  # A missing fixture here is not "test skipped", it is "test lied" — fail
-  # the whole run instead of finishing green with this fixture silently gone.
+  # A missing fixture fails the run instead of finishing green without it.
   echo "make-fixtures: FATAL — wal_hotcopy fixture could not be built" >&2
   exit 1
 fi
 
 cp "$WORK/live.db"     "$OUT/wal_hotcopy.db"
 cp "$WORK/live.db-wal" "$OUT/wal_hotcopy.db-wal"
-# Same main file, but WITHOUT its -wal: demonstrates data loss, not the
-# readonly error. The CREATE TABLE/INSERT above never got checkpointed into
-# the main file (all of it still sat in the WAL when we copied), so a reader
-# given only wal_hotcopy_nowal.db sees a table-less database, not an error.
+# The same main file without its -wal: every write still sits in the WAL, so
+# a reader given only wal_hotcopy_nowal.db sees a database with no tables.
 cp "$WORK/live.db"     "$OUT/wal_hotcopy_nowal.db"
 
 wait "$HOLDER_PID" 2>/dev/null || true
 
-# Self-check: wal_hotcopy.db must read correctly under the exact flags
-# sqlite.js uses. That is this fixture's actual job — proving the common case
-# (hot copy, writable directory) stays a normal read, not an error.
+# Self-check: wal_hotcopy.db reads correctly under the flags sqlite.js uses.
 GOT=$(sqlite3 -readonly -safe -json "$OUT/wal_hotcopy.db" "SELECT COUNT(*) AS n FROM t")
 echo "$GOT" | grep -q '"n":3' \
   || { echo "make-fixtures: FATAL — wal_hotcopy.db did not read back 3 rows under -readonly -safe (got: $GOT)" >&2; exit 1; }
 
-# --- self-check: reading a WAL-journaled database THROUGH THE TOOL must -----
-# come back with real data, not a quietly wrong empty schema. Measured on the
-# real Alpine binary (sqlite-spec-272.md §1/§3): opening a database whose
-# schema and rows live entirely in an uncheckpointed -wal via `immutable=1`
-# does not error and does not warn — it just silently skips the journal's
-# content, so `sqlite_master` comes back with no tables and any query against
-# one of them fails as "no such table", indistinguishable from a typo. The raw
-# check just above proves the fixture file itself is fine under
-# `-readonly -safe`; this one instead calls sqlite.js's own query() — the
-# actual code path a tool call takes, prepareOpen() included — and would fail
-# if a future change ever let `immutable=1` reach a database with a real
-# journal again. row_count/n confirm the data came through; wal_copy=== true
-# confirms it went through the copy path rather than immutable, which is the
-# part that actually matters here.
+# --- self-check: a WAL-journaled database read through sqlite.js ----------
+# Opening a database whose content lives only in an uncheckpointed -wal via
+# `immutable=1` silently skips the journal: `sqlite_master` has no tables and
+# a query fails with "no such table". This check calls query() from
+# sqlite.js, prepareOpen() included: n confirms the data came through, and
+# wal_copy === true confirms the copy path was taken instead of immutable=1.
 CHECK_JS="$OUT/.wal-copy-check.js"
 cat > "$CHECK_JS" <<'JS'
 const path = require('path');
 const S = require(path.join(process.env.SQLITE_MODULE_DIR, 'sqlite.js'));
 const SP = require(path.join(process.env.SQLITE_MODULE_DIR, 'safepath.js'));
-// Since 2.8.0 sqlite.js takes a checked path, not a string — the same one the
-// server hands it, resolved against the vault root. A fixture directory
-// outside VAULT_PATH is refused here exactly as it would be through a tool.
+// sqlite.js takes a path checked against the vault root, not a string. A
+// fixture directory outside VAULT_PATH is refused here as through a tool.
 const dbPath = SP.createResolver(process.env.VAULT_PATH)
   .resolveSafe(path.join(process.env.FIXTURES_DIR, 'wal_hotcopy.db'));
 (async () => {
@@ -236,28 +197,13 @@ rm -f "$CHECK_JS"
 [ "$CHECK_RC" -eq 0 ] \
   || { echo "make-fixtures: FATAL — wal-copy check failed (see above)" >&2; exit 1; }
 
-# --- self-check: hard_heap_limit actually stops a query that allocates a ---
-# lot in one place: hex(zeroblob(200000000)) forces a single ~400 MB text
-# buffer (200 MB source blob, 2 bytes of hex per source byte), comfortably
-# over the 256 MiB (268435456 byte) limit. This replaces an earlier version
-# that used an unbounded recursive CTE under max() (SELECT max(n) FROM (WITH
-# RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)):
-# measured on the real Alpine binary, that query used sys 0.05s over a full
-# 20s run — an infinite CPU-bound COUNT, not a memory allocation, and 8 MiB
-# was not enough to make it error either. timeout_ms was catching it, and
-# QUERY_TIMEOUT was always the correct answer for that shape, not a defect —
-# see sqlite-spec.md for the corrected premise. hex(zeroblob(N)) is what the
-# spec's own examples of real memory pressure look like (a big sort,
-# group_concat over many rows, hex() on a large BLOB): one allocation, sized
-# up front, nothing to iterate — so it is fast and bounded even where the
-# limiter does not work (confirmed on this machine: resolves in ~100ms
-# instead of hanging), unlike the CTE it replaces.
+# --- self-check: hard_heap_limit stops a large allocation -----------------
+# hex(zeroblob(200000000)) forces one ~400 MB text buffer (2 bytes of hex per
+# source byte), over the 256 MiB (268435456 byte) limit. One allocation, sized
+# up front: fast and bounded even where the limit does not work.
 #
-# This runs sqlite.js itself (not raw sqlite3) because the thing being checked
-# is OUR error-code mapping (QUERY_TOO_LARGE), not just the underlying SQLite
-# behaviour. It asserts the error is actually raised — it does not skip when
-# the limiter is unavailable, and it will fail on anything other than exactly
-# QUERY_TOO_LARGE.
+# Runs sqlite.js itself, because the error-code mapping is what is checked:
+# anything other than exactly QUERY_TOO_LARGE fails, and nothing is skipped.
 CHECK_JS="$OUT/.hard-heap-limit-check.js"
 cat > "$CHECK_JS" <<'JS'
 const path = require('path');

@@ -1,11 +1,11 @@
 'use strict';
 /**
- * Vault MCP — trash retention sweep (2.6.0)
+ * Vault MCP — trash retention sweep
  *
  * Off by default. A zone opts in with `retention_enabled: true` on the marker
  * that also defines its trash.
  *
- * Deliberate limits, all of them load-bearing:
+ * Limits:
  *  - no recursive delete anywhere; files are removed one by one, directories
  *    only by rmdir, which refuses a non-empty one. With no recursion there is
  *    also no way to walk out of the vault along a symlink.
@@ -14,9 +14,8 @@
  *  - only paths physically inside a trash directory allowed by the policy in
  *    force are considered.
  *
- * Context for anyone tempted to switch this on by default: the vault backup is
- * a mirror without history (rsync --delete, no --backup-dir). What is erased
- * here disappears from the NAS at the next run.
+ * Off by default: with a backup that mirrors without history, an erased file
+ * disappears from the backup at its next run.
  */
 
 const fs = require('fs');
@@ -47,7 +46,7 @@ function sweepTrash(trashDir, days, root) {
       let st;
       try { st = fs.lstatSync(full.path); } catch { continue; }
       if (st.isDirectory()) { dirs.push(full); walk(full); continue; }
-      if (!st.isFile()) continue;              // symlinks, sockets, devices — not ours
+      if (!st.isFile()) continue;              // symlinks, sockets, devices: skipped
       const stamp = P.stampOf(e.name);
       if (!stamp) { unstamped++; continue; }
       if (stamp.getTime() > cutoff) { kept++; continue; }
@@ -64,8 +63,8 @@ function sweepTrash(trashDir, days, root) {
 
   walk(trashDir);
 
-  // Bottom-up so a directory emptied by this pass can go too. rmdir refuses a
-  // non-empty directory by itself — that is the whole guard.
+  // Bottom-up, so a directory emptied by this pass goes too. rmdir refuses a
+  // non-empty directory.
   let dirsRemoved = 0;
   for (const d of dirs.sort((a, b) => b.path.length - a.path.length)) {
     try { fs.rmdirSync(d.path); dirsRemoved++; } catch {}
@@ -92,9 +91,8 @@ function runSweep(root) {
     if (!policy.retention_enabled) continue;
     const trashDir = P.trashDirOf(policy);
     if (!trashDir) continue;
-    // Only the zone that OWNS the trash sweeps it. Otherwise a child that
-    // merely inherited the trash could order a purge of its parent's. Compared
-    // by string — the brands are never the same object.
+    // Only the zone that owns the trash sweeps it; a child that inherited the
+    // trash does not. Compared by string: two brands are different objects.
     if (policy.trashOwner.path !== dir.path) continue;
     if (seen.has(trashDir.path)) continue;
     seen.add(trashDir.path);

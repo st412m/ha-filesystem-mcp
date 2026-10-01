@@ -1,14 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * Vault MCP — the "Vault policies" page (2.6.0)
+ * Vault MCP — the "Vault policies" page
  *
- * The ONLY channel that writes .vault-policy markers. It listens on its own
- * port (3101, ingress, not published in `ports:`) and runs its own
- * http.createServer — the MCP dispatcher on 3099 has no reference to the write
- * function below. That separation is the point: the 3100 proxy forwards a bare
- * path prefix, so anything reachable on 3099 is reachable from the internet
- * with the token, and a marker writer must not be.
+ * The only code that writes .vault-policy markers. It runs its own HTTP server
+ * on its own port (3101, ingress, not published in `ports:`); the MCP server on
+ * 3099 has no reference to the write function below.
  *
  * Per Home Assistant's add-on docs, ingress traffic arrives only from
  * 172.30.32.2; every other source is refused. The base URL is taken from the
@@ -27,9 +24,7 @@ const SUPERVISOR_IP = '172.30.32.2';
 // Local testing only (`ALLOW_LOCAL=true node policy-ui.js /tmp/vault`).
 const ALLOW_LOCAL = process.env.ALLOW_LOCAL === 'true';
 
-// Until 2.7.3 this file carried its own byte-for-byte copy of resolveSafe.
-// Both copies now come from safepath.js; ROOT is the branded vault root, and
-// anything that leaves this process as JSON takes `.path`.
+// ROOT is the branded vault root; anything sent as JSON takes `.path`.
 const R = SP.createResolver(process.argv[2] || process.env.VAULT_PATH || '/media/VAULT');
 const resolveSafe = R.resolveSafe;
 const ROOT = R.root;
@@ -38,6 +33,25 @@ function fromSupervisor(req) {
   const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   if (ip === SUPERVISOR_IP) return true;
   return ALLOW_LOCAL && (ip === '127.0.0.1' || ip === '::1');
+}
+
+// policy_page_users, one entry per line (run.sh). Empty = every HA user.
+const PAGE_USERS = (process.env.POLICY_PAGE_USERS || '').split('\n').map(s => s.trim()).filter(Boolean);
+const NOT_LISTED = 'Forbidden: this Home Assistant user is not listed in policy_page_users\n';
+
+// Exactly one X-Remote-User-Id and at most one X-Remote-User-Name, header
+// names in any case; a second copy is treated as forged. The ID or the name
+// must equal an entry of the list exactly.
+function pageUserAllowed(rawHeaders, allowList) {
+  if (!allowList || !allowList.length) return true;
+  const ids = [], names = [];
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const k = String(rawHeaders[i]).toLowerCase();
+    if (k === 'x-remote-user-id') ids.push(String(rawHeaders[i + 1]));
+    else if (k === 'x-remote-user-name') names.push(String(rawHeaders[i + 1]));
+  }
+  if (ids.length !== 1 || names.length > 1) return false;
+  return allowList.includes(ids[0]) || (names.length === 1 && allowList.includes(names[0]));
 }
 
 // ---------------------------------------------------------------------------
@@ -57,14 +71,12 @@ function writeMarker(dir, spec) {
     retention_enabled: spec.retention_enabled,
     retention_days: spec.retention_days,
   };
-  // Validate the exact bytes that will land on disk, before anything is
-  // written: a marker this page itself cannot parse would lock the zone.
+  // The exact bytes are validated before writing: a marker that cannot be
+  // parsed would lock the zone.
   P.parseMarker(JSON.stringify(body));
 
-  // Both destinations are re-checked rather than merely joined onto dir: this
-  // is the only place in the add-on that writes a marker, and a directory that
-  // turned into a symlink out of the vault between the tree scan and the save
-  // would otherwise be written to.
+  // Both destinations are re-checked, not just joined onto dir: the directory
+  // may have become a symlink out of the vault since the tree was read.
   const target = resolveSafe(SP.child(dir, P.POLICY_FILE).path);
   const tmp = resolveSafe(SP.child(dir, `.vault-policy.tmp-${process.pid}-${Date.now()}`).path);
   const text = JSON.stringify(body, null, 2) + '\n';
@@ -74,8 +86,7 @@ function writeMarker(dir, spec) {
   return target.path;
 }
 
-// unlink never follows the final symlink, so a marker that is one gets removed
-// rather than followed — the lexical path is enough here.
+// unlink does not follow the final symlink, so the lexical path is enough.
 function removeMarker(dir) {
   const target = SP.child(dir, P.POLICY_FILE);
   try { fs.unlinkSync(target.path); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -83,18 +94,13 @@ function removeMarker(dir) {
 }
 
 // ---------------------------------------------------------------------------
-// Tree: the root and what sits directly in it. One level, deliberately.
+// Tree: the root and the directories directly in it.
 // ---------------------------------------------------------------------------
 
-// Three outcomes, and the difference matters on the page. trashDirOf() is
-// lexical — the name comes from a marker, not from a readdir — so a trash that
-// is a symlink out of the vault would otherwise have someone else's directory
-// counted and shown as this zone's. Anything that is not a directory, symlink
-// included, therefore counts as unknown (null, rendered without a number),
-// same as a trash this zone does not own; the sweep refuses such a trash on
-// the same lstat. A trash that simply does not exist yet is not unknown: it is
-// created by the first trash_file, and until then it holds nothing, so it
-// counts 0 and the page keeps saying "trash (0)" as it did before 2.8.0.
+// Three outcomes. trashDirOf() is lexical, so a trash that is not a directory
+// (a symlink included) counts as unknown: null, shown without a number, and
+// refused by the sweep on the same lstat. A trash that does not exist yet
+// counts 0: the first trash_file creates it.
 function countTrash(trashDir) {
   let st;
   try { st = fs.lstatSync(trashDir.path); }
@@ -162,9 +168,8 @@ function buildTree() {
   }
   children.sort((a, b) => a.name.localeCompare(b.name));
 
-  // Markers placed deeper than one level are not created here, but they must be
-  // visible — somebody will drop one in by hand, and an invisible rule is worse
-  // than a strict one. Directories only, bounded, no file walking.
+  // Markers deeper than one level are not created here, but are listed.
+  // Directories only, bounded, no file walking.
   // Keyed by string: scan.dirs holds brands, and two brands for the same
   // directory are different objects.
   const scan = P.findMarkerDirs(ROOT, memo);
@@ -221,6 +226,7 @@ function json(res, code, obj) {
 
 const server = http.createServer((req, res) => {
   if (!fromSupervisor(req)) { res.writeHead(403, { 'Content-Type': 'text/plain' }); res.end('Forbidden\n'); return; }
+  if (!pageUserAllowed(req.rawHeaders, PAGE_USERS)) { res.writeHead(403, { 'Content-Type': 'text/plain' }); res.end(NOT_LISTED); return; }
 
   const url = req.url.split('?')[0].replace(/\/+$/, '') || '/';
 
@@ -257,9 +263,15 @@ const server = http.createServer((req, res) => {
   res.end('Not found\n');
 });
 
-server.listen(PORT, () => {
-  process.stderr.write(`Vault policy page v${VERSION} on port ${PORT} (ingress), vault: ${ROOT.path}\n`);
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    process.stderr.write(`Vault policy page v${VERSION} on port ${PORT} (ingress), vault: ${ROOT.path}\n`);
+    if (!PAGE_USERS.length)
+      process.stderr.write('[policy-ui] policy page is open to every Home Assistant user (policy_page_users is empty)\n');
+  });
+}
+
+module.exports = { server, pageUserAllowed };
 
 // ---------------------------------------------------------------------------
 // The page itself

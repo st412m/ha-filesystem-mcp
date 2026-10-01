@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Vault MCP — read-only SQLite inspection (2.7.0, WAL side-file fix in 2.7.2)
+ * Vault MCP — read-only SQLite inspection
  *
  * Two tools, schema-neutral: sqlite_schema() looks at what is in the file,
  * sqlite_query() runs exactly one read-only statement. Neither interprets the
@@ -11,35 +11,22 @@
  * ATTACH, .shell, .system, .open, writefile(), edit(), load_extension(),
  * fts3_tokenizer() — ATTACH matters most, since without it a query reads any
  * file on disk regardless of the vault's own zone check), and scanSql(), which
- * tokenizes the statement before sqlite3 is ever started.
+ * tokenizes the statement before sqlite3 is started.
  *
- * The `SELECT * FROM (<sql>) LIMIT <n>` wrapper is NOT one of them, and until
- * 2.8.0 the comments here said otherwise. A wrapper can be closed from the
- * inside: `SELECT 1 AS x) ; SELECT 2 AS y /*` ends up as two statements, the
- * `)` closing the wrapper's parenthesis and the unterminated `/*` swallowing
- * the `) LIMIT n` that should have followed — measured, both statements ran.
- * The wrapper gives a row limit, truncation detection and a row-producing
- * shape, and it can only do that because the scanner has already guaranteed
- * balanced parentheses, closed comments and no second statement.
+ * The `SELECT * FROM (<sql>) LIMIT <n>` wrapper is not one of them: a wrapper
+ * can be closed from the inside (`SELECT 1 AS x) ; SELECT 2 AS y /*`). It gives
+ * a row limit, truncation detection and a row-producing shape, and is safe to
+ * build only because the scanner guarantees balanced parentheses, closed
+ * comments and no second statement.
  *
- * 2.7.2 adds a fourth concern, orthogonal to the three above: how the file
- * gets opened at all. A plain `-readonly` open of a WAL-mode database still
- * creates a `-shm` and (if missing) a `-wal` sibling next to it — harmless on
- * its own, but the add-on's main use case is a vault synced by Syncthing,
- * where every read then propagates two new files to every other device. See
- * prepareOpen() below for the fix (immutable URI or a private copy) and
- * sqlite-spec-272.md §1 for the measurement behind it.
+ * How the file is opened is a separate concern: a plain `-readonly` open of a
+ * WAL-mode database creates `-shm` and `-wal` siblings next to it, which a
+ * synced folder then propagates. See prepareOpen() (immutable URI or a private
+ * copy).
  *
- * schema()/query() still perform no containment check of their own — this
- * module has no idea where the vault root is, and neither it nor policy.js
- * duplicates resolveSafe's escape-hardening, which took two rounds to get
- * right (see the 2.5.0 symlink/sibling-prefix note in safepath.js). What
- * changed in 2.8.0 is that the contract is now checked instead of assumed:
- * `p` must be a path produced by safepath.js, and pathOf() refuses anything
- * else with UNVERIFIED_PATH before a single byte is read. Until 2.7.3 this
- * was a comment, and 2.7.1's acceptance walked straight past it — calling
- * query()/schema() directly with a string, bypassing server.js, read a file
- * outside the vault. That call now throws.
+ * schema()/query() do no containment check of their own: `p` must be a path
+ * produced by safepath.js, and pathOf() refuses anything else with
+ * UNVERIFIED_PATH before a byte is read.
  *
  * Past the entry point the path is an ordinary string again: this module
  * derives -wal/-shm siblings and a temp copy from it, and none of those are
@@ -64,37 +51,16 @@ const DEFAULT_TIMEOUT_MS = 5000, MAX_TIMEOUT_MS = 30000;
 const DEFAULT_COUNTS_TIMEOUT_MS = 60000, MAX_COUNTS_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_STDOUT_BYTES = 1024 * 1024; // 1 MiB ceiling on sqlite3's stdout
 
-// A LIMIT wrapped around the outer statement does not bound an unbounded
-// recursive CTE sitting under an aggregate — SELECT max(n) FROM (WITH
-// RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c)
-// must fully materialize the (infinite) input before max() can produce a row,
-// so the LIMIT in query()'s wrapper never gets a chance to matter. Without a
-// second, independent stop that failure mode grows in memory until timeout_ms
-// (up to 30s) or the OOM killer takes the whole add-on process with it —
-// every file tool included, not just this query. Confirmed against the real
-// Alpine sqlite3 in the add-on image (3.49.2, by hand, not from this
-// machine): PRAGMA hard_heap_limit sets from the default off (0) and turns
-// that query into "out of memory" instead of unbounded growth. This machine's
-// own sqlite3 (Windows, 3.44.4) is not evidence either way for anything
-// involving -safe's exact restricted-command list or heap enforcement — it
-// has already been wrong once (see runSqlite()'s comment on the pragma's
-// echo) — so nothing here is asserted as verified unless it was actually run
-// against the real Alpine binary.
-// 256 MiB, hardcoded and not exposed as a tool parameter: raising it changes
-// what "unbounded" means for every query and every table's COUNT(*), not just
-// the one call that asked for it.
+// Working-memory limit of every sqlite3 call (PRAGMA hard_heap_limit; off by
+// default in SQLite). A query that allocates past it fails with
+// QUERY_TOO_LARGE instead of growing until the process is killed. 256 MiB,
+// fixed, not a tool parameter: it applies to every query and every COUNT(*).
 const HARD_HEAP_LIMIT_BYTES = 268435456;
 
 const STATEMENT_KEYWORDS = ['SELECT', 'WITH', 'VALUES', 'EXPLAIN'];
 
-// Tool option keys, snake_case, identical to the inputSchema property names in
-// server.js — no camelCase alter ego anywhere in this module. The previous
-// version accepted opts.countsTimeoutMs internally while server.js and the
-// tool schema both said counts_timeout_ms: server.js's translation from one
-// name to the other was correct, but a translation step is exactly the kind
-// of place a typo hides for three rounds without ever failing loudly. Options
-// are now read under their tool-schema names directly, and an unrecognized
-// key is a hard error instead of a silent no-op — see assertKnownOptions().
+// Tool option keys, identical to the inputSchema property names in server.js.
+// An unrecognized key is an error (assertKnownOptions()).
 const SCHEMA_OPTION_KEYS = ['counts', 'counts_timeout_ms'];
 const QUERY_OPTION_KEYS = ['limit', 'timeout_ms'];
 
@@ -104,11 +70,8 @@ function assertKnownOptions(opts, allowed, toolName) {
     throw new Error(`unknown option(s) for ${toolName}: ${unknown.join(', ')} — accepted: ${allowed.join(', ')}`);
 }
 
-// One row, six columns, two spawns total for sqlite_schema instead of seven —
-// every pragma here takes zero or one argument, which SQLite has exposed as a
-// table-valued function since 3.16.0. Verified against the actual sqlite3
-// binary before relying on it: a plain cross join of six single-row functions
-// returns one row with all six columns correctly named.
+// One row, six columns, one spawn: each pragma is used as a table-valued
+// function (SQLite 3.16.0+), cross-joined.
 const PRAGMA_QUERY =
   'SELECT * FROM pragma_journal_mode(), pragma_page_size(), pragma_page_count(), ' +
   'pragma_encoding(), pragma_user_version(), pragma_application_id()';
@@ -125,12 +88,8 @@ function clampInt(v, def, min, max, name) {
   return t;
 }
 
-// This add-on is public and its vault is not always read from the same
-// machine or timezone — a hardcoded MSK offset (2.7.0/2.7.1's mtime_msk) is
-// wrong for anyone else and was removed in 2.7.2 (breaking response-format change, see
-// CHANGELOG.md). This reads the container's own local time via plain Date
-// getters (respecting its TZ, whatever that is) and appends the numeric
-// offset instead of a fixed abbreviation — no Intl/tz-data dependency.
+// The container's local time (its TZ) with a numeric offset, from plain Date
+// getters: no Intl or tz-data dependency.
 function toLocalOffsetString(d) {
   const offMin = -d.getTimezoneOffset();
   const sign = offMin >= 0 ? '+' : '-';
@@ -156,9 +115,8 @@ function assertRegularFile(p) {
   return st;
 }
 
-// null unless every byte is printable ASCII — a hex dump of genuine binary
-// garbage (an encrypted SQLCipher header, random bytes) gains nothing from an
-// ASCII rendering, so it is only added when it would actually read as text.
+// null unless every byte is printable ASCII: binary data gets no ASCII
+// rendering.
 function asciiIfPrintable(buf) {
   let s = '';
   for (const b of buf) {
@@ -168,9 +126,7 @@ function asciiIfPrintable(buf) {
   return s;
 }
 
-// Type is decided by the first 16 bytes only, never the extension — Bluecoins
-// backups do not end in .db, and guessing from a suffix is a guaranteed bug
-// report waiting to happen.
+// The file type is decided by the first 16 bytes, never by the extension.
 function checkSqliteHeader(p) {
   const fd = fs.openSync(p, 'r');
   try {
@@ -190,17 +146,14 @@ function checkSqliteHeader(p) {
 
 // ---------------------------------------------------------------------------
 // Where to open the file from: the original path via an `immutable=1` URI, or
-// a private copy of it plus its `-wal`. Decided ONCE per tool call (by
-// schema()/query(), not by runSqlite()) — sqlite_schema with counts:true
-// spawns sqlite3 once per table, and copying inside that per-spawn helper
-// would make one call to a database with a dozen tables copy a
-// possibly-hundreds-of-MB file a dozen times over.
+// a private copy of it plus its `-wal`. Decided once per tool call (by
+// schema()/query(), not by runSqlite()): sqlite_schema with counts:true spawns
+// sqlite3 once per table, and the file is copied once.
 // ---------------------------------------------------------------------------
 
-// Percent-encodes one path segment at a time so sqlite3's URI parser doesn't
-// choke on a space, `?`, `#` or `%` in the file name, while the `/`
-// separators between segments stay literal. Encoding a character that didn't
-// need it is harmless — sqlite3 percent-decodes the whole thing before use.
+// Percent-encodes each path segment for sqlite3's URI parser (a space, `?`,
+// `#` or `%` in a name); the `/` separators stay literal. sqlite3 decodes the
+// whole URI before use.
 function encodeSqliteUriPath(p) {
   return p.split('/').map(encodeURIComponent).join('/');
 }
@@ -209,30 +162,19 @@ function buildImmutableUri(p) {
   return `file:${encodeSqliteUriPath(p)}?immutable=1`;
 }
 
-// A zero-length -wal is this module's own past artifact (or some other
-// reader's), not a real journal — treating it as "journal present" would
-// permanently exile that database to the copy path over nothing forever
-// after. No sibling at all reads the same way: no journal either way.
+// A zero-length -wal is not a real journal; it reads the same as no -wal.
 function walIsPresent(origPath) {
   try { return fs.statSync(`${origPath}-wal`).size > 0; }
   catch { return false; }
 }
 
-// No journal → open the ORIGINAL file in place through `immutable=1`: sqlite3
-// skips locking and the -shm/-wal dance entirely, so a database living in a
-// synced folder gains no sibling files from being read (measured on the real
-// Alpine binary — sqlite-spec-272.md §1). This is deliberately not used when
-// a real -wal sits next to the file: immutable tells sqlite3 the file will
-// not change and nothing needs replaying, so it reads past an uncheckpointed
-// journal's content rather than through it — on a database whose schema
-// lives entirely in the -wal this comes back as an empty schema and "no such
-// table", not a warning (confirmed against wal_hotcopy.db; see the matching
-// regression test in the test matrix). So when a journal is present, the
-// main file and its -wal are copied together into a fresh directory made for
-// this call and opened from there instead — new -shm/-wal siblings are only
-// ever allowed to appear in that throwaway copy, which is removed whole
-// afterwards. -shm is not copied: it is a regenerable lock/index structure,
-// not data, and the copy's directory is always writable.
+// No journal: the original file is opened in place through `immutable=1`, so
+// sqlite3 skips locking and creates no -shm/-wal siblings. With a real -wal
+// this is not used: immutable reads past an uncheckpointed journal (a schema
+// that lives in the -wal comes back empty, with "no such table"). Then the
+// main file and its -wal are copied into a fresh directory for this call and
+// opened there; the directory is removed afterwards. -shm is not copied: it is
+// a regenerable index, not data.
 function prepareOpen(origPath) {
   if (!walIsPresent(origPath)) {
     return { openPath: buildImmutableUri(origPath), cleanup: () => {}, viaCopy: false, copyMs: null };
@@ -252,21 +194,14 @@ function prepareOpen(origPath) {
     };
   } catch (e) {
     if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    // Not a checkpoint problem (the copy destination is our own temp dir,
-    // always writable) — this is our own copy step failing: no space left,
-    // source unreadable, temp dir not writable. Kept as WAL_PRESENT_READONLY
-    // for the error code's continuity, but the text is now about the copy,
-    // not about checkpointing — see sqlite-spec-272.md §3. Known-uncovered
-    // synthetically, same as before: nothing in test/ makes mkdtempSync or
-    // copyFileSync fail on purpose.
+    // The copy step failed: no space, unreadable source, or an unwritable temp
+    // directory. No test triggers this branch.
     throw new Error(`WAL_PRESENT_READONLY: could not prepare a working copy of ${origPath} alongside its -wal journal — ${e.message}`);
   }
 }
 
-// Low-level spawn, shared by every call into sqlite3. execFile — no shell,
-// argv array, SQL is one argv element. stdin is explicitly closed: sqlite3
-// does not read it when SQL is given as an argument, but nothing here should
-// depend on that. cwd is a fresh temp dir per call, removed afterwards.
+// Low-level spawn: execFile, no shell, SQL is one argv element. stdin is
+// closed. cwd is a fresh temp dir per call, removed afterwards.
 function spawnSqlite3(args, { timeoutMs, maxBuffer } = {}) {
   return new Promise((resolve, reject) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-sqlite-'));
@@ -299,26 +234,15 @@ function mapSpawnError(err, timeoutMs) {
   if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(err.message || ''))
     return new Error(`OUTPUT_TOO_LARGE: sqlite3 output exceeded ${MAX_STDOUT_BYTES} bytes — narrow the column list or lower limit. No partial result is returned.`);
   const msg = (err.stderrSoFar || err.message || '').toString().trim();
-  // hard_heap_limit tripped: the query's working memory, not its output, is
-  // the problem — a large sort, group_concat() over many rows, hex()/similar
-  // on a large BLOB: something that allocates a lot in one place. Distinct
-  // from OUTPUT_TOO_LARGE (a large RESULT reaching stdout) and QUERY_TIMEOUT
-  // (ran too long, whatever the memory use — an unbounded recursive CTE
-  // under an aggregate is CPU-bound, not memory-bound: measured at sys 0.05s
-  // over a full 20s run on the real Alpine binary, so timeout_ms is its
-  // correct stop, not this one — see sqlite-spec.md).
+  // hard_heap_limit tripped: the query's working memory (a large sort,
+  // group_concat() over many rows, hex() on a large BLOB), not its output
+  // (OUTPUT_TOO_LARGE) or its run time (QUERY_TIMEOUT).
   if (/out of memory/i.test(msg))
     return new Error(`QUERY_TOO_LARGE: the query exceeded its working-memory limit (${HARD_HEAP_LIMIT_BYTES} bytes, fixed) and was stopped — something in it allocates a lot in one place (a large sort, group_concat() over many rows, hex()/similar on a large BLOB). Narrow the query or reduce what it aggregates.`);
-  // WAL_PRESENT_READONLY no longer comes from here (matching sqlite3's own
-  // "attempt to write a readonly database" / "unable to open database file"
-  // text against a -wal sibling, as in 2.7.1). Since 2.7.2 dbPath is always
-  // either opened `immutable=1` (no journal, nothing to write) or is already
-  // a copy of the original sitting in our own always-writable temp dir (a
-  // real journal was present) — see prepareOpen(). That open failing for a
-  // read-only-directory reason should no longer happen; if it does, it falls
-  // through to the generic SQLITE_ERROR below rather than a wrong-sounding
-  // dedicated one. The dedicated code is now raised directly by prepareOpen()
-  // when the copy step itself fails.
+  // dbPath is either opened `immutable=1` or is a copy in a writable temp
+  // directory (prepareOpen()), so a read-only-directory failure falls through
+  // to SQLITE_ERROR. WAL_PRESENT_READONLY is raised by prepareOpen() when the
+  // copy fails.
   return new Error(`SQLITE_ERROR: ${msg}`);
 }
 
@@ -332,25 +256,11 @@ function parseJsonRows(stdout) {
   return rows;
 }
 
-// PRAGMA hard_heap_limit=N is itself a query: it prints its own result ahead
-// of the trailing SQL argument's own output, on the same stdout, back to
-// back, no separator between them. (First tried suppressing it with .output
-// around just that statement; -safe rejects .output outright — "cannot run
-// .output in safe mode" — confirmed against the real Alpine binary, not this
-// machine's.) Rather than fight the echo, it is put to use: this is the one
-// place we can see, on every single call, that this build's sqlite3 actually
-// accepted the limit — a PRAGMA name SQLite does not recognize is normally a
-// silent no-op.
-//
-// What that echo looks like is not pinned to one exact string: a build-time
-// smoke test in toolchain-check.sh, running what reads like the identical
-// command line, once got back a bare 268435456 where this got back
-// [{"hard_heap_limit":268435456}] — same value, different serialization, for
-// a reason neither of us could pin down from source alone (not a flag-order
-// difference: the two argv sequences compared byte-for-byte identical). What
-// is not in doubt is the VALUE, so that is what gets checked — either known
-// form confirms the limit is live, and pinning the check to one exact string
-// was the actual bug, not a symptom of a different one.
+// PRAGMA hard_heap_limit=N prints its own result ahead of the query's output,
+// on the same stdout, with no separator (-safe refuses .output, so it cannot
+// be suppressed). The echo shows on every call that this sqlite3 accepted the
+// limit; an unknown PRAGMA name would do nothing, silently. It comes back as
+// JSON or as the bare number, so the value is checked, not one form.
 const HEAP_LIMIT_ECHO_CANDIDATES = [
   `[{"hard_heap_limit":${HARD_HEAP_LIMIT_BYTES}}]`, // -json mode
   `${HARD_HEAP_LIMIT_BYTES}`,                        // default (list) mode
@@ -377,34 +287,22 @@ function heapLimitUnconfirmedError(gotSoFar) {
   return err;
 }
 
-// Checking the echo only after the process exits (as an earlier version of
-// this function did, via spawnSqlite3/execFile) means an unbounded query on a
-// build where the limit silently did not take hold gets to run to completion
-// — or to timeout_ms, or to the OS OOM-killer — before the check ever runs.
-// That is exactly the case this whole mechanism exists to catch: the
-// protection would arrive after the damage, not instead of it. So this reads
-// stdout as it streams in instead of buffering it: the echo is the first
-// thing sqlite3 ever writes, checked against the exact expected bytes as soon
-// as enough of them have arrived (or killed the moment they diverge, without
-// waiting for a full line) — before the trailing SQL argument's query has any
-// real chance to grow. This is why runSqlite() cannot share spawnSqlite3()
-// (execFile only hands back stdout once the process has already exited);
-// sqliteVersion() has no query to protect against and keeps using it.
+// stdout is read as it streams: the echo is the first thing sqlite3 writes,
+// and the process is killed as soon as it diverges from every known form,
+// before the query has a chance to grow. A check after exit would come only
+// once an unlimited query had already run. That is why runSqlite() does not
+// use spawnSqlite3() (execFile returns stdout after exit); sqliteVersion()
+// does.
 function runSqliteChecked(openPath, sql, timeoutMs) {
   return new Promise((resolve, reject) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vmcp-sqlite-'));
     const cleanup = () => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} };
-    // openPath is whatever prepareOpen() decided for this call: a `file:...
-    // ?immutable=1` URI, or the path of our own copy — sqlite3 parses the URI
-    // form on this build without needing a `-uri` flag (that flag does not
-    // exist on Alpine's sqlite3 3.49.2 at all — confirmed, do not add it).
-    // `.explain off` is load-bearing for EXPLAIN: the CLI switches itself into
-    // a fixed-column text layout for EXPLAIN and EXPLAIN QUERY PLAN output and
-    // ignores -json while it is on, so parseJsonRows() would see a drawn table
-    // and raise MALFORMED_OUTPUT. Turning it off restores JSON (addr/opcode/p1…
-    // and id/parent/notused/detail). It must stay AFTER the pragma: the echo
-    // check below expects the pragma's own output to be the first bytes on
-    // stdout, and `.explain off` prints nothing of its own.
+    // openPath is what prepareOpen() decided: a `file:...?immutable=1` URI or
+    // the path of the private copy. sqlite3 parses the URI form without a
+    // `-uri` flag, which Alpine's sqlite3 does not have.
+    // `.explain off`: otherwise the CLI draws EXPLAIN and EXPLAIN QUERY PLAN
+    // output as a text table and ignores -json. It stays after the pragma,
+    // whose echo must be the first bytes on stdout; it prints nothing itself.
     const args = ['-cmd', `PRAGMA hard_heap_limit=${HARD_HEAP_LIMIT_BYTES};`, '-cmd', '.explain off', '-readonly', '-safe', '-json', openPath, sql];
 
     let child;
@@ -469,10 +367,8 @@ function runSqliteChecked(openPath, sql, timeoutMs) {
 }
 
 async function runSqlite(openPath, sql, timeoutMs) {
-  // Every caller goes through here, so sqlite_schema's DDL/PRAGMA queries and
-  // every table's COUNT(*) get the same limit and the same streamed
-  // confirmation that sqlite_query does. openPath is prepareOpen()'s result,
-  // decided once per tool call — never the original path directly.
+  // Every query goes through here, so all of them get the same limit and the
+  // same echo check. openPath is prepareOpen()'s result for this call.
   let res;
   try { res = await runSqliteChecked(openPath, sql, timeoutMs); }
   catch (err) {
@@ -508,10 +404,8 @@ async function schema(brandedPath, opts) {
   const st = assertRegularFile(p);
   checkSqliteHeader(p);
 
-  // One open decision for the whole call — not one per spawn. counts:true
-  // spawns sqlite3 once per table (thirteen times on the recorder database);
-  // deciding immutable-vs-copy inside runSqlite() would copy the file that
-  // many times over for one sqlite_schema call. See prepareOpen().
+  // One open decision for the whole call, not one per spawn (counts:true
+  // spawns sqlite3 once per table). See prepareOpen().
   const { openPath, cleanup, viaCopy, copyMs } = prepareOpen(p);
   try {
     const version = await sqliteVersion();
@@ -524,16 +418,9 @@ async function schema(brandedPath, opts) {
       counts = {};
       const tableNames = objects.filter(o => o.type === 'table').map(o => o.name);
       for (const name of tableNames) {
-        // Each table gets its OWN full counts_timeout_ms window — one slow table
-        // (a full scan on a large one) must not take the rest of the schema down
-        // with it, and a fast table is not charged for a slow neighbour. The
-        // window covers the whole per-table call (spawning sqlite3, opening the
-        // database file, running COUNT(*)), not just the count itself, so on a
-        // large database file a very small window can time out even a table
-        // with a handful of rows — see DOCS.md. counts stays number|null
-        // throughout; which tables timed out goes in incompleteTables as a
-        // plain list, not a duplicated per-table message (a base with dozens of
-        // tables would otherwise repeat the same sentence dozens of times).
+        // Each table gets its own counts_timeout_ms window, covering the whole
+        // per-table call (spawn, open, COUNT(*)). counts stays number|null;
+        // tables that timed out are listed once in incompleteTables.
         try {
           const rows = await runSqlite(openPath, `SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`, countsTimeoutMs);
           counts[name] = rows.length ? Object.values(rows[0])[0] : null;
@@ -583,32 +470,26 @@ function firstKeyword(s) {
 }
 
 // EXPLAIN and EXPLAIN QUERY PLAN are modifiers, not statements: what follows
-// has to be a statement in its own right. Whitespace only after the keyword —
-// a comment there (EXPLAIN/**/SELECT 1) does not match and is refused, which
-// is the conservative side to be on.
+// has to be a statement in its own right. Only whitespace may follow the
+// keyword: a comment there (EXPLAIN/**/SELECT 1) is refused.
 const EXPLAIN_PREFIX_RE = /^EXPLAIN(\s+QUERY\s+PLAN)?\s+/i;
 const EXPLAINABLE_KEYWORDS = STATEMENT_KEYWORDS.filter(k => k !== 'EXPLAIN');
 
 // Tokenizer, not a parser: it walks the statement once and records what it
 // finds, so that a ";" inside a string literal, a quoted identifier or a
 // comment is left alone while a ";" that really does end a statement is
-// caught. Until 2.8.0 this was sql.includes(';'), which refused the first and
-// was the only thing standing between a crafted query and a second statement.
+// caught.
 //
 // The rules below are taken from SQLite's own src/tokenize.c
 // (sqlite3GetToken, tag version-3.49.2). Where this disagrees with SQLite it
-// may only disagree by refusing more, never less — `/*` at the very end of the
-// input is SQLite's division operator and our unterminated comment, and that
-// asymmetry is the acceptable direction.
+// only refuses more, never less: `/*` at the very end of the input is
+// SQLite's division operator and an unterminated comment here.
 //
-// Bind parameters are refused outright rather than modelled. SQLite reads
-// $name(...) as ONE token and consumes everything up to a ")" or whitespace
-// inside those brackets, quote characters included, so a scanner that knows
-// only strings, comments and parentheses is walked straight through by
-// `SELECT 1 AS x WHERE $a(') ) ; SELECT 2 AS y /*')` — it sees $a( then a
-// string then ), while sqlite3 runs the second statement. Modelling that
-// syntax to keep a feature nothing here can use would be the wrong trade:
-// sqlite_query has no parameters to bind in the first place.
+// Bind parameters are refused, not modelled. SQLite reads $name(...) as one
+// token, quote characters inside the brackets included, so in
+// `SELECT 1 AS x WHERE $a(') ) ; SELECT 2 AS y /*')` a scanner of strings,
+// comments and parentheses would miss the second statement. sqlite_query has
+// nothing to bind anyway.
 //
 // Pure: it reads the string and returns what it found. The caller decides
 // which finding to raise.
@@ -696,7 +577,7 @@ function scanSql(sql) {
     // Everything else is an ordinary character, backslash included — SQLite
     // has no backslash escape. That covers the x of a blob literal too: the
     // "'" after it opens a string here, and SQLite closes the blob on the same
-    // "'" we close the string on.
+    // "'" that closes the string here.
     i++;
   }
 
@@ -706,14 +587,13 @@ function scanSql(sql) {
   return findings;
 }
 
-// Raised by priority, not by position: an unbalanced parenthesis and a ";"
-// in the same statement mean the statement is malformed, and saying so is more
-// use than pointing at the ";".
+// Raised by priority, not by position: an unbalanced parenthesis and a ";" in
+// the same statement are reported as malformed.
 const SCAN_PRIORITY = ['MALFORMED_SQL', 'PARAMETERS_NOT_SUPPORTED', 'MULTIPLE_STATEMENTS'];
 
-// Checks run in this exact order, each with its own error code — see
-// sqlite-spec.md. Since 2.8.0 these checks ARE the protection against a second
-// statement, alongside -readonly and -safe: nothing downstream would catch one.
+// Checks run in this order, each with its own error code. Together with
+// -readonly and -safe they are the protection against a second statement:
+// nothing downstream would catch one.
 //
 // Returns the statement split into the part that must stay OUTSIDE the wrapper
 // and the part that goes inside it. `prefix` is empty for everything except
@@ -760,15 +640,12 @@ async function query(brandedPath, rawSql, opts) {
   checkSqliteHeader(p);
   const { prefix, sql } = validateSql(rawSql);
 
-  // The wrapper rejects anything that is not a row-producing expression and
-  // gives a truncation signal for free — asking for limit+1 rows and dropping
-  // the extra one if it came back. It does NOT guarantee a single statement;
-  // scanSql() does, and the wrapper is only safe to build because of it. A
-  // recursive CTE inside the subquery is parsed by SQLite normally.
+  // The wrapper rejects anything that is not row-producing and detects
+  // truncation (limit+1 rows asked, the extra one dropped). It does not
+  // guarantee a single statement; scanSql() does.
   //
-  // The newlines around the query are load-bearing. A perfectly legal "--"
-  // comment at the end of the query would otherwise run on into the ") LIMIT n"
-  // and swallow it; a newline ends the comment before the wrapper closes.
+  // The newlines around the query end a trailing "--" comment before the
+  // wrapper's ") LIMIT n".
   //
   // An EXPLAIN prefix sits in front of the whole wrapper, never inside it, so
   // what gets explained is the wrapped statement. Two consequences, both in
@@ -805,4 +682,4 @@ async function query(brandedPath, rawSql, opts) {
   };
 }
 
-module.exports = { schema, query };
+module.exports = { schema, query, validateSql };

@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.9.0 — 2026-10-01
+
+Policies follow the real place of a directory reached through a symlink, tools carry titles and annotations, the protocol version is negotiated, and the Vault policies page can be limited to listed users.
+
+### Added
+- A title and MCP annotations (read-only, destructive, idempotent, open-world) on every tool.
+- Protocol version negotiation: `initialize` answers with the client's version when it is `2025-06-18`, `2025-03-26` or `2024-11-05`, otherwise with `2025-06-18`.
+- A request with an unsupported `MCP-Protocol-Version` header gets 400; `initialize` is not checked.
+- `pv=` field with the `MCP-Protocol-Version` header in the request log.
+- Option `policy_page_users`: Home Assistant users allowed to open the Vault policies page.
+- `url` in the app manifest, linking the app page to the repository.
+
+### Changed
+- A directory reached through a symlink inside the vault follows the policy and the trash of its real place; the policy line in listings ends with `(via symlink: resolves to …)`.
+- `grep_files` works on a directory or file reached through a symlink inside the vault.
+- `Accept: */*` and `Accept: application/*` are accepted; media-type parameters and letter case are ignored.
+
+### Fixed
+- A request body of `null`, or a batch element that is not an object, gets JSON-RPC error `-32600` instead of stopping the server; an unexpected error in a request answers 500.
+
 ## 2.8.0 — 2026-09-24
 
 The check that a path is inside the vault now lives in one module and is verified by the modules behind it rather than assumed, zone refusals carry a code, `EXPLAIN` runs, and the SQL statement check is a tokenizer instead of a search for `;`.

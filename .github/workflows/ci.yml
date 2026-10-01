@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: for f in filesystem_mcp/*.js; do node --check "$f"; done
+      # The glob is quoted: node expands it itself.
+      - name: Tests
+        run: node --test "test/*.test.js"
+      - name: Documentation examples
+        run: node tools/check-doc-examples.mjs
+      - name: Secret scan
+        run: node tools/scan-secrets.mjs

@@ -9,6 +9,7 @@ The app's options, where to put the vault, what the first start creates, and how
 | `token` | string | `changeme` | Secret in the URL path: the endpoint is `/private_<token>/mcp` on port 3100. |
 | `vault_path` | string | `/media/VAULT` | The directory the server exposes. Everything outside it is unreachable. |
 | `log_requests` | bool | `false` | One log line per request in the auth proxy. |
+| `policy_page_users` | list of strings | `[]` | Home Assistant users allowed to open the Vault policies page, by user name or user ID. Empty: every Home Assistant user. |
 
 Generate a token with `cat /proc/sys/kernel/random/uuid` in the Home Assistant terminal. Changing an option takes effect after restarting the app.
 
@@ -82,10 +83,10 @@ Files can be dropped into `raw/` over the Samba share (`\\<your-ha-ip>\VAULT`) o
 With `log_requests: true` the auth proxy logs one line per request:
 
 ```
-[req] 2026-07-13T10:56:25.478Z 160.79.106.34 POST /private_***/mcp -> 200 172B ua="Claude-User"
+[req] 2026-07-13T10:56:25.478Z 160.79.106.34 POST /private_***/mcp -> 200 172B pv=- ua="Claude-User"
 ```
 
-Fields: UTC timestamp, client IP (`CF-Connecting-IP`, then the first `X-Forwarded-For` address, then the socket address), method, path with the token masked as `/private_***`, status, response size in bytes, User-Agent. Requests refused with 401 or 404 are logged too, with `(unauthorized)` or `(not allowed)` appended. With the default `false` the proxy logs nothing per request. How to use this is in [troubleshooting.md](troubleshooting.md#seeing-the-requests).
+Fields: UTC timestamp, client IP (`CF-Connecting-IP`, then the first `X-Forwarded-For` address, then the socket address), method, path with the token masked as `/private_***`, status, response size in bytes, the `MCP-Protocol-Version` header (`-` when absent, cut to 40 characters), User-Agent. Requests refused with 401 or 404 are logged too, with `(unauthorized)` or `(not allowed)` appended. With the default `false` the proxy logs nothing per request. How to use this is in [troubleshooting.md](troubleshooting.md#seeing-the-requests).
 
 ## Exposing the server
 

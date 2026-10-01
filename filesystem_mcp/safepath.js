@@ -1,37 +1,28 @@
 'use strict';
 /**
- * Vault MCP — the one place a path is checked against the vault (2.8.0)
+ * Vault MCP — the one place a path is checked against the vault
  *
- * Until 2.7.3 resolveSafe() existed twice, byte for byte, in server.js and in
- * policy-ui.js, and the modules behind them (policy.js, retention.js,
- * sqlite.js) accepted whatever string they were handed. "This path has already
- * been checked" was a comment, and a comment had already been walked past once
- * — 2.7.1's acceptance called sqlite.js directly and read a file outside the
- * vault. Here the check hands back a branded value instead of a string, and
- * those modules refuse anything else.
+ * The check hands back a branded value instead of a string, and policy.js,
+ * retention.js and sqlite.js refuse anything else.
  *
  * The brand is a frozen { path } registered in this module's private `issued`
  * map. Nothing outside this file can put an entry in it, so an object of the
- * same shape built by hand is not a path as far as pathOf() is concerned.
- * Deliberately not a class — `instanceof` is forged with
- * Object.create(SafePath.prototype); deliberately not a flag on the object —
- * a flag asks the caller to confirm, it does not check.
+ * same shape built by hand is not a path as far as pathOf() is concerned. Not
+ * a class (`instanceof` can be forged with Object.create) and not a flag on the
+ * object.
  *
- * The map is a WeakMap rather than a WeakSet, and its value is the PRIVATE
- * record of the resolver that issued the brand — not the object createResolver
- * hands back. That is what lets child() and parent() be plain module-level
- * functions that still know which vault a path belongs to (policy.js holds no
- * resolver of its own), while the brand constructor stays inside this file:
- * the returned resolver is frozen and exposes root, resolveSafe, child and
- * parent, none of which mints a brand for an unchecked string. Membership —
- * issued.has(x) — is the whole verification either way.
+ * The map's value is the private record of the resolver that issued the
+ * brand, not the object createResolver hands back. So child(), parent() and
+ * canonical() are module-level functions that know which vault a path belongs
+ * to, while the brand constructor stays inside this file: the returned
+ * resolver is frozen and exposes root, resolveSafe, child, parent and
+ * canonical, none of which mints a brand for an unchecked string.
+ * issued.has(x) is the whole verification.
  *
- * Where the boundary honestly is: createResolver is exported, so code in this
- * process that deliberately builds a resolver over some other root will get
- * brands under that root, and they will pass pathOf(). That is not the attack
- * this defends against. It defends against a check that was forgotten, not
- * against one that was deliberately replaced — an in-process caller that wants
- * to go around it can always call fs directly anyway.
+ * The boundary: createResolver is exported, so code in this process that
+ * builds a resolver over another root gets brands under that root. This
+ * guards against a forgotten check, not against code that deliberately goes
+ * around it.
  *
  * UNVERIFIED_PATH means a module was called with a path that did not come from
  * here. It is an internal contract failure, not a user-visible refusal: every
@@ -46,10 +37,9 @@ const path = require('path');
 // and private, so only the code in this file can register one.
 const issued = new WeakMap();
 
-// Pure string containment, shared by everything that has to ask "is this under
-// that". Not a bare startsWith(root): that accepts a sibling whose name merely
-// shares the prefix (/media/VAULT_backup for /media/VAULT). Compares strings
-// and touches no disk, so it takes no brand — callers pass `.path`.
+// String containment. Not a bare startsWith(root), which would accept a sibling
+// sharing the prefix (/media/VAULT_backup for /media/VAULT). No disk access, so
+// it takes strings: callers pass `.path`.
 function inside(p, root) {
   return p === root || p.startsWith(root + path.sep);
 }
@@ -58,9 +48,8 @@ function isSafePath(x) {
   return issued.has(x);
 }
 
-// The gate every module puts in front of its own path arguments. `where` is
-// the name of that module's function, so the message says who was called
-// wrongly rather than where the check happens to live.
+// The gate every module puts in front of its path arguments. `where` names the
+// calling function in the error message.
 function pathOf(x, where) {
   if (!issued.has(x))
     throw new Error(`UNVERIFIED_PATH: ${where} requires a path produced by resolveSafe(), got ${typeof x}`);
@@ -71,37 +60,38 @@ function describeName(name) {
   return typeof name === 'string' ? JSON.stringify(name.slice(0, 40)) : typeof name;
 }
 
-// One step DOWN from a path that is already verified. For tree walks only: the
-// name comes from a readdir of that very directory, so there is no new
-// containment question to answer and no realpath to pay for.
+// One step down from a verified path, for tree walks: the name comes from a
+// readdir of that directory, so no realpath is needed.
 //
-// The guarantee is LEXICAL — child() does not resolve symlinks. That is sound
-// only because the walks using it do not follow them either (they test the
-// dirent type, or lstat). Anything that decides where a write LANDS must go
-// through resolveSafe(), never through child(): a name that came from a policy
-// marker instead of from readdir can point at a symlink out of the vault.
+// The guarantee is lexical: child() does not resolve symlinks, and the walks
+// using it do not follow them (they test the dirent type, or lstat). Where a
+// write lands is decided by resolveSafe(), never by child(): a name from a
+// policy marker can point at a symlink out of the vault.
 function child(parent, name) {
   const base = pathOf(parent, 'child');
-  // path.sep is redundant with '/' on the Alpine image and only matters when
-  // this file is exercised from a Windows checkout — cheap, and it keeps
-  // path.join() from ever seeing a separator it would honour.
+  // path.sep matters only on Windows; it keeps path.join() from seeing a
+  // separator.
   if (typeof name !== 'string' || !name || name.includes('/') || name.includes(path.sep) ||
       name.includes('\0') || name === '.' || name === '..')
     throw new Error(`UNVERIFIED_PATH: child() takes one path segment, got ${describeName(name)}`);
   return issued.get(parent).make(path.join(base, name));
 }
 
-// One step UP, with a full check — deliberately not the lexical dirname.
-// resolveSafe() verifies realpath at the path itself, not at its ancestors, so
-// the parent of a verified path is not automatically a verified path.
-// Measured on 2.7.3: with tmp/fs280-out a symlink out of the vault and
-// tmp/fs280-out/back a symlink back into it, write_file on the latter was
-// accepted — the lexical parent chain ran through a directory outside the
-// vault and the zone was read from the wrong side. Going up therefore costs a
-// realpath, on every write. That is the price of the check being real.
+// One step up, with a full check, not the lexical dirname: resolveSafe()
+// verifies realpath at the path itself, not at its ancestors, so the parent of
+// a verified path (for example under a symlink that leaves the vault and leads
+// back in) is checked again. This costs a realpath on every write.
 function parent(p) {
   const dir = path.dirname(pathOf(p, 'parent'));
   return issued.get(p).resolveSafe(dir);
+}
+
+// The real place of a verified path, expressed under ROOT: symlinks on the way
+// are resolved, a tail that does not exist yet is kept as is. Policies and
+// trash comparisons use this; what a tool prints keeps the lexical path.
+function canonical(p) {
+  const lexical = pathOf(p, 'canonical');
+  return issued.get(p).canonical(lexical);
 }
 
 // One resolver per process and per root: server.js and the grep worker over
@@ -109,10 +99,9 @@ function parent(p) {
 function createResolver(rootPath) {
   const ROOT = path.resolve(rootPath);
 
-  // Real path of the vault, resolved once. The vault root itself is often
-  // reached through a symlink on HAOS (/media → /mnt/data/supervisor/media),
-  // so escape checks must compare against the resolved root, not the literal
-  // one.
+  // Real path of the vault, resolved once. On HAOS the vault root is reached
+  // through a symlink (/media → /mnt/data/supervisor/media), so escape checks
+  // compare against the resolved root.
   let REAL_ROOT = ROOT;
   try { REAL_ROOT = fs.realpathSync(ROOT); } catch {}
 
@@ -122,15 +111,10 @@ function createResolver(rootPath) {
     return b;
   }
 
-  // Hardened in 2.5.0. Two holes were closed:
-  //   1. startsWith(ROOT) alone accepted sibling directories whose name
-  //      merely shares the prefix (/media/VAULT_backup passed for /media/VAULT).
-  //   2. Symlinks inside the vault pointing outside it were followed silently —
-  //      `..` was blocked, a symlink was not.
-  // For paths that do not exist yet (write_file, create_directory, move_file
-  // destinations) the nearest existing ancestor is resolved instead.
-  // The checks below are carried over unchanged from 2.7.3; only the return
-  // value became a brand.
+  // Refuses a path outside ROOT (a sibling sharing the name prefix included)
+  // and a path whose realpath leaves REAL_ROOT. For a path that does not exist
+  // yet (write_file, create_directory, move_file destinations) the nearest
+  // existing ancestor is resolved instead.
   function resolveSafe(p) {
     if (typeof p !== 'string' || !p) throw new Error('path must be a non-empty string');
     const resolved = path.resolve(p);
@@ -150,14 +134,38 @@ function createResolver(rootPath) {
     }
   }
 
-  // What the WeakMap stores. child() and parent() reach the constructor and
-  // the check through it — never through the object returned below, which
-  // carries no way to mint a brand.
-  const internal = { make, resolveSafe };
+  // realpath of the nearest existing ancestor, mapped from REAL_ROOT back to
+  // ROOT, plus the missing tail. Any realpath error other than ENOENT throws.
+  function canonicalOf(lexical) {
+    const tail = [];
+    let probe = lexical;
+    for (;;) {
+      let real;
+      try {
+        real = fs.realpathSync(probe);
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+        const up = path.dirname(probe);
+        if (up === probe) throw new Error(`PATH_OUTSIDE_VAULT: ${lexical}`);
+        tail.unshift(path.basename(probe));
+        probe = up;
+        continue;
+      }
+      if (!inside(real, REAL_ROOT)) throw new Error(`PATH_OUTSIDE_VAULT: ${lexical} (symlink resolves outside the vault)`);
+      const out = path.join(ROOT, path.relative(REAL_ROOT, real), ...tail);
+      if (!inside(out, ROOT)) throw new Error(`PATH_OUTSIDE_VAULT: ${lexical}`);
+      return make(out);
+    }
+  }
 
-  // The root is a root by definition — branded directly rather than resolved,
-  // so a vault that does not exist yet still gives a usable resolver.
-  return Object.freeze({ root: make(ROOT), resolveSafe, child, parent });
+  // What the WeakMap stores. child(), parent() and canonical() reach the
+  // constructor and the check through it — never through the object returned
+  // below, which carries no way to mint a brand.
+  const internal = { make, resolveSafe, canonical: canonicalOf };
+
+  // The root is branded directly rather than resolved, so a vault that does not
+  // exist yet still gives a usable resolver.
+  return Object.freeze({ root: make(ROOT), resolveSafe, child, parent, canonical });
 }
 
-module.exports = { createResolver, isSafePath, pathOf, inside, child, parent };
+module.exports = { createResolver, isSafePath, pathOf, inside, child, parent, canonical };

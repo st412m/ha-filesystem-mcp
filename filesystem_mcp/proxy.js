@@ -6,7 +6,7 @@ const LISTEN_PORT = 3100;
 const PREFIX = `/private_${TOKEN}`;
 const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
 
-// Never let a secret (ours or a client's misconfigured old one) reach the log.
+// A token in a path (this one or any other) is masked before it is logged.
 function maskPath(url) {
   return url.replace(/\/private_[^/?]+/g, '/private_***').slice(0, 120);
 }
@@ -21,8 +21,9 @@ function clientIp(req) {
 function logLine(req, status, bytes, note) {
   if (!LOG_REQUESTS) return;
   const ua = req.headers['user-agent'] || '-';
+  const pv = req.headers['mcp-protocol-version'];
   console.log(
-    `[req] ${new Date().toISOString()} ${clientIp(req)} ${req.method} ${maskPath(req.url)} -> ${status} ${bytes}B ua="${ua}"${note ? ' ' + note : ''}`
+    `[req] ${new Date().toISOString()} ${clientIp(req)} ${req.method} ${maskPath(req.url)} -> ${status} ${bytes}B pv=${pv === undefined ? '-' : pv.slice(0, 40)} ua="${ua}"${note ? ' ' + note : ''}`
   );
 }
 
@@ -37,12 +38,9 @@ const server = http.createServer((req, res) => {
   const upstreamUrl = req.url.slice(PREFIX.length);
   const finalUrl = upstreamUrl.startsWith('/') ? upstreamUrl : '/' + upstreamUrl;
 
-  // 2.6.0: an allow-list instead of blind forwarding. Until now this proxy cut
-  // the token prefix off and passed whatever was left to 3099, so every route
-  // the server ever grows is published on the internet the moment it exists —
-  // that is how POST /write came to be reachable from outside. The MCP endpoint
-  // is the only thing that belongs out here; the policy page is on its own port
-  // behind ingress and must never be reachable through this path.
+  // Only /mcp is forwarded. Any route the server gains is not published by
+  // this proxy, and the policy page (its own port, ingress only) is never
+  // reachable through it.
   if (finalUrl.split('?')[0] !== '/mcp') {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found\n');

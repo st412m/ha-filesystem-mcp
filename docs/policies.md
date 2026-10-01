@@ -23,6 +23,12 @@ Any other field is an error, and so is a wrong type or value (see [If a marker b
 
 Markers are read on every tool call, with no cache between calls, so a change on the page applies to the next call.
 
+A directory reached through a symlink inside the vault follows the policy of the place the symlink points to, and that place's trash. The policy line in a listing then ends with where the path resolves:
+
+```
+Policy: read-only, no trash (deletion not available) — inherited from /media/VAULT/raw/.vault-policy (via symlink: resolves to /media/VAULT/raw/ha)
+```
+
 ## Modes
 
 The **Vault policies** page offers five modes per directory. Each maps onto the fields:
@@ -39,7 +45,7 @@ The **Vault policies** page offers five modes per directory. Each maps onto the 
 
 ## The Vault policies page
 
-The app adds **Vault policies** to the Home Assistant sidebar. The page is served through ingress only; it is not reachable through the token URL. It is the only thing that writes markers. MCP tools refuse to create, change, move or discard anything named `.vault-policy`, including a directory of that name.
+The app adds **Vault policies** to the Home Assistant sidebar. The page is served through ingress only; it is not reachable through the token URL. Who may open it is set by `policy_page_users` ([configuration](configuration.md#options)); with an empty list, every Home Assistant user can. It is the only thing that writes markers. MCP tools refuse to create, change, move or discard anything named `.vault-policy`, including a directory of that name.
 
 The page shows the vault root and the directories directly inside it: put policies on top-level directories and let everything below inherit. A marker placed deeper by hand is listed separately, with a button to remove it. Choosing **inherits** removes a directory's marker.
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
- * Vault MCP Server — StreamableHTTP транспорт
- * Полная замена supergateway + @modelcontextprotocol/server-filesystem
- * Добавляет: read_pdf_page (JPEG) и read_pdf_text (pdftotext)
+ * Vault MCP Server: MCP over Streamable HTTP (JSON responses) for one
+ * directory tree, the vault.
  */
 
 const http = require('http');
@@ -15,21 +14,18 @@ const P = require('./policy');
 const SQLITE = require('./sqlite');
 const SP = require('./safepath');
 
-// grep_files runs in a forked copy of THIS file (argv: --grep-worker <vault>).
-// Rationale: node has no way to time out a regex. A catastrophically
-// backtracking pattern ((a+)+$ on a long run of 'a') wedges the event loop and
-// takes the whole MCP server with it — and this addon listens on a port. A
-// child process can simply be SIGKILLed. See grepSpawn().
+// grep_files runs in a forked copy of this file (argv: --grep-worker <vault>):
+// a running regex cannot be interrupted in node, a child process can be
+// killed. See grepSpawn().
 const GREP_WORKER = process.argv[2] === '--grep-worker';
 
 const VERSION = process.env.ADDON_VERSION || '0.0.0-dev';
 const ALLOWED_DIR = path.resolve((GREP_WORKER ? process.argv[3] : process.argv[2]) || '/media/VAULT');
 const PORT = parseInt(process.argv[3] || '3099');
 
-// The zone check and its hardening now live in safepath.js — one copy for the
-// whole add-on. resolveSafe() hands back a branded path, not a string: every
-// fs call below takes `.path` at the syscall itself, and policy.js, sqlite.js
-// and retention.js refuse anything that did not come from here.
+// resolveSafe() (safepath.js) hands back a verified path, not a string: every
+// fs call below takes `.path` at the call itself, and policy.js, sqlite.js and
+// retention.js refuse anything that did not come from it.
 const R = SP.createResolver(ALLOWED_DIR);
 const resolveSafe = R.resolveSafe;
 
@@ -48,14 +44,21 @@ function revOfFile(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Policy enforcement (2.6.0)
+// Policy enforcement
 // ---------------------------------------------------------------------------
-// Markers are read on every call — there is no cache between calls, so a policy
-// changed on the page takes effect on the next tool call. `memo` is created per
-// call and dies with it.
+// Markers are read on every call, with no cache between calls. `memo` lives for
+// one call only.
 
-function policyOfDir(dir, memo) {
-  return P.policyForDir(dir, R.root, memo);
+// { policy, real }: the policy of dir and dir's real place (a brand). Every
+// comparison with a trash directory is made in these real coordinates.
+function zoneOf(dir, memo) {
+  return P.policyAt(dir, R.root, memo);
+}
+
+// Where p sits in real coordinates, given the zone of its directory. Not the
+// realpath of p itself: p may be a symlink, and the link is what gets moved.
+function realPathOf(p, zone) {
+  return path.join(zone.real.path, path.basename(p.path));
 }
 
 function assertNotMarker(p, verb) {
@@ -63,27 +66,26 @@ function assertNotMarker(p, verb) {
     throw new Error(`${P.POLICY_FILE} cannot be ${verb} through MCP tools — the marker is owned by the add-on's "Vault policies" page (Home Assistant sidebar). A directory or file of that name created here would lock the zone with no way to repair it from this side.`);
 }
 
-// Common gate for anything that changes the tree at `p`. Returns the effective
-// policy of the directory that holds p.
+// Common gate for anything that changes the tree at `p`. Returns the zone
+// ({ policy, real }) of the directory that holds p.
 function guardWrite(p, memo, verb) {
   assertNotMarker(p, verb);
-  // parentDir, not path.dirname: on 2.7.3 a destination reached through a
-  // symlink out of the vault and back in took its policy from the lexical
-  // chain, i.e. from the wrong zone. The parent is re-checked for real.
-  const dir = parentDir(p);
-  const policy = policyOfDir(dir, memo);
+  // parentDir, not path.dirname: the parent is re-checked against the vault.
+  const zone = zoneOf(parentDir(p), memo);
+  const { policy, real } = zone;
   if (policy.error) throw new Error(`Refused — ${policy.error}`);
   if (policy.readonly)
-    throw new Error(`Refused — ${dir.path} is read-only by policy (${P.describePolicy(policy, dir.path)}). Nothing was written.`);
-  return policy;
+    throw new Error(`Refused — ${real.path} is read-only by policy (${P.describePolicy(policy, real.path)}). Nothing was written.`);
+  return zone;
 }
 
 // Second gate: the object already exists, so this is a change to existing
 // content rather than a creation.
-function guardOverwrite(p, policy, rev, what) {
+function guardOverwrite(p, zone, rev, what) {
+  const policy = zone.policy;
   if (!fs.existsSync(p.path)) return false;
   if (policy.overwrite === 'never')
-    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p.path))}): ${p.path} already exists and existing files may not be ${what}. Nothing was written.`);
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, zone.real.path)}): ${p.path} already exists and existing files may not be ${what}. Nothing was written.`);
   if (policy.overwrite === 'rev') {
     let cur;
     try { cur = revOfFile(p); }
@@ -96,12 +98,12 @@ function guardOverwrite(p, policy, rev, what) {
   return true;
 }
 
-// Moving a file OUT of a strict zone needs the same rev as overwriting it in
-// place. Without this the whole thing is bypassed in three steps: move to a
-// free zone, edit there, move back — the way back counts as a creation.
-function guardTakeOut(p, policy, rev, verb) {
+// Moving a file out of a strict zone needs the same rev as overwriting it in
+// place; otherwise move out, edit, move back would bypass the zone.
+function guardTakeOut(p, zone, rev, verb) {
+  const policy = zone.policy;
   if (policy.overwrite === 'never')
-    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, path.dirname(p.path))}): existing files may not be ${verb} out of this zone.`);
+    throw new Error(`Refused — policy "overwrite: never" (${P.describePolicy(policy, zone.real.path)}): existing files may not be ${verb} out of this zone.`);
   if (policy.overwrite === 'rev') {
     const cur = revOfFile(p);
     if (rev === undefined || rev === null || rev === '')
@@ -111,17 +113,17 @@ function guardTakeOut(p, policy, rev, verb) {
   }
 }
 
-// A trash directory that no marker claims any more. Left strictly alone, but
-// said out loud so it is not mistaken for a live one.
-function orphanTrashNote(dir, policy) {
+// A trash directory that no policy in force claims: left alone, and reported.
+function orphanTrashNote(dir, zone) {
+  const { policy, real } = zone;
   const live = P.trashDirOf(policy);
   const names = new Set([P.DEFAULT_TRASH]);
   if (policy.trash) names.add(policy.trash);
   const notes = [];
   for (const n of names) {
-    const cand = SP.child(dir, n);
+    const cand = SP.child(real, n);
     if (live && cand.path === live.path) continue;
-    try { if (fs.lstatSync(cand.path).isDirectory()) notes.push(`⚠ ${cand.path} looks like a trash directory but no policy in force claims it — left alone.`); } catch {}
+    try { if (fs.lstatSync(cand.path).isDirectory()) notes.push(`⚠ ${SP.child(dir, n).path} looks like a trash directory but no policy in force claims it — left alone.`); } catch {}
   }
   return notes;
 }
@@ -155,9 +157,7 @@ function toInt(v, name) {
   return Math.trunc(n);
 }
 
-// Fix for issue #2: some MCP clients (claude.ai / Claude Desktop) serialize
-// array parameters as JSON strings instead of native arrays.
-// Defensively parse them back before use.
+// Some MCP clients send array parameters as JSON strings; they are parsed back.
 function coerceArray(v, name) {
   if (typeof v === 'string') {
     try { v = JSON.parse(v); }
@@ -232,9 +232,7 @@ function listDirWithSizes(p, sortBy = 'name') {
   return lines.join('\n') + `\n\nTotal: ${items.filter(i => !i.isDir).length} files, ${items.filter(i => i.isDir).length} directories\nCombined size: ${(total / 1024).toFixed(2)} KB`;
 }
 
-// Trash directories are omitted: a discarded page that keeps turning up in a
-// tree (or a grep) gets read and quoted again as if it were live. The count of
-// omissions is printed, so nothing disappears silently.
+// Trash directories are omitted from the tree; their number is printed.
 function dirTree(p, memo, policy, level, hidden) {
   level = level || 0;
   if (level > 2) return '';
@@ -272,9 +270,8 @@ function globToRe(glob) {
   return new RegExp(src);
 }
 
-// Long lines are clipped AROUND the match, not from the start: in this vault a
-// single line can be several KB, and a head-clip would routinely hide the very
-// thing that matched.
+// Long lines are clipped around the match, not from the start, so the match
+// stays visible.
 function clipAround(line, at, len, max) {
   if (line.length <= max) return line;
   const lead = Math.floor(max / 3);
@@ -291,20 +288,22 @@ function grepRun(job) {
   const excRe = job.exclude ? globToRe(job.exclude) : null;
   const maxLine = job.maxLineLength;
 
-  // The job crosses a process boundary, so the root arrives as a plain string —
-  // a brand does not survive IPC, and it should not: the worker checks the
-  // path against its own root rather than trusting what it was sent. Twice
-  // over, deliberately.
+  // The root arrives as a plain string (a verified path does not cross IPC) and
+  // is checked again against the worker's own root.
   const root = resolveSafe(job.root);
 
-  // Strings from here on: these are read-only paths produced by a walk of an
-  // already-checked root, and they get sorted and printed.
+  // Strings from here on: read-only paths from a walk of a checked root.
   const files = [];
-  const st = fs.lstatSync(root.path);
+  const memo = new Map();
+  // The walk runs over the root's real place, so every policy and trash met on
+  // the way share one set of coordinates; printed paths are mapped back under
+  // the root as it was requested.
+  const zone = P.policyAt(root, R.root, memo);
+  const shown = full => root.path + full.path.slice(zone.real.path.length);
+  const st = fs.lstatSync(zone.real.path);
   if (st.isFile()) {
     files.push(root.path);
   } else if (st.isDirectory()) {
-    const memo = new Map();
     const walk = (dir, policy) => {
       const trash = P.trashDirOf(policy);
       let entries;
@@ -320,11 +319,11 @@ function grepRun(job) {
         } else if (e.isFile()) {
           if (excRe && excRe.test(e.name)) continue;
           if (incRe && !incRe.test(e.name)) continue;
-          files.push(full.path);
+          files.push(shown(full));
         }
       }
     };
-    walk(root, P.policyForDir(root, R.root, memo));
+    walk(zone.real, zone.policy);
   } else {
     throw new Error(`not a file or directory: ${root.path}`);
   }
@@ -376,9 +375,8 @@ function grepRun(job) {
       bytes += rendered.length + 1;
       prev = n;
       if (isHit) matches++;
-      // Both caps are checked per rendered line, not per file: a single file can
-      // hold thousands of matching multi-KB lines, and a per-file check would let
-      // one file blow the whole budget before anyone looks at it.
+      // Both caps are checked per rendered line, not per file: one file can hold
+      // thousands of matching lines.
       if (isHit && matches >= job.maxResults) { stop = `max_results=${job.maxResults} reached`; break; }
       if (bytes > GREP_MAX_BYTES) { stop = `response byte cap (${GREP_MAX_BYTES} B) reached`; break; }
     }
@@ -398,9 +396,8 @@ function grepSpawn(job) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      // execArgv: [] is load-bearing — fork() inherits the parent's node flags
-      // by default, and a parent started as `node -e "..."` would otherwise
-      // re-run that script in the child instead of server.js (fork bomb).
+      // execArgv: [] — fork() inherits the parent's node flags, and a parent
+      // started with `node -e` would run that script again in the child.
       child = fork(__filename, ['--grep-worker', ALLOWED_DIR], {
         execArgv: [], stdio: ['ignore', 'ignore', 'pipe', 'ipc']
       });
@@ -425,9 +422,25 @@ function grepSpawn(job) {
   });
 }
 
+// title is sent twice: top-level (protocol 2025-06-18) and annotations.title
+// (2025-03-26). All four hints are explicit and describe the tool's worst case.
+function meta(title, h) {
+  return {
+    title,
+    annotations: {
+      title,
+      readOnlyHint: h.readOnly,
+      destructiveHint: h.destructive,
+      idempotentHint: h.idempotent,
+      openWorldHint: h.openWorld,
+    },
+  };
+}
+
 const TOOLS = [
   {
     name: 'grep_files',
+    ...meta('Search file contents', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Search file CONTENTS by regex, recursively. Per file returns path, rev, line count, then matching line numbers with their text. Long lines are clipped around the match (max_line_length, default 200). Line numbers and rev feed straight into read_text_file offset/limit and edit_file line edits. Binaries and symlinks are skipped; output is capped and flags truncation when incomplete.',
     inputSchema: {
       type: 'object',
@@ -446,6 +459,7 @@ const TOOLS = [
   },
   {
     name: 'read_text_file',
+    ...meta('Read text file', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Read a text file. Whole file by default; head/tail = N lines from an edge; offset/limit = an arbitrary 1-based line range, which also reports total lines and rev (needed for edit_file line edits).',
     inputSchema: {
       type: 'object',
@@ -461,16 +475,19 @@ const TOOLS = [
   },
   {
     name: 'read_file',
+    ...meta('Read file (deprecated)', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'DEPRECATED alias of read_text_file.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, head: { type: 'number' }, tail: { type: 'number' }, offset: { type: 'number' }, limit: { type: 'number' } }, required: ['path'] }
   },
   {
     name: 'read_media_file',
+    ...meta('Read media file', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Read an image, audio or PDF file. PDF returns one page (default 1, or "#N" path suffix) as JPEG plus the total page count.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'read_pdf_page',
+    ...meta('Render PDF page', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Render one PDF page (1-based) as JPEG. Prefer read_pdf_text unless layout or graphics matter.',
     inputSchema: {
       type: 'object',
@@ -480,6 +497,7 @@ const TOOLS = [
   },
   {
     name: 'read_pdf_text',
+    ...meta('Extract PDF text', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Extract text from a PDF (pdftotext -layout), whole document or a page range. Much cheaper than page images — prefer it; fall back to read_pdf_page for scans.',
     inputSchema: {
       type: 'object',
@@ -489,6 +507,7 @@ const TOOLS = [
   },
   {
     name: 'sqlite_schema',
+    ...meta('Inspect SQLite schema', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Inspect a SQLite database file: schema-neutral, no interpretation of the data. File type is decided by the first 16 bytes, not the extension. Returns table/index/view/trigger DDL from sqlite_master, the journal_mode/page_size/page_count/encoding/user_version/application_id PRAGMAs, the sqlite3 version, whether -wal/-shm siblings exist next to the ORIGINAL file, plus path/size/mtime (UTC and local with numeric offset). A database with no journal (or an empty leftover one) is opened in place and leaves no new files behind; one with a real -wal is read from a private copy instead, cleaned up after the call — wal_copy/wal_copy_ms in the response say whether that happened and how long it took. Either way nothing is ever left next to the original. counts=true adds COUNT(*) per table, off by default — it is a full scan and can take minutes on a large database. counts_timeout_ms is a PER-TABLE budget covering the whole call (spawning sqlite3 and opening the file, not just the COUNT itself) — on a large database file a very small budget can time out even a tiny table. A table that does not finish is null in counts; every such table is listed in counts_incomplete.tables with one shared counts_incomplete.note, not a message repeated per table. The rest of the schema is always returned in full. Call once without counts first, then again with counts only if row counts are actually needed — the DDL comes back in full either way, so a second call re-sends everything already read, which matters on a database with a hundred tables.',
     inputSchema: {
       type: 'object',
@@ -502,6 +521,7 @@ const TOOLS = [
   },
   {
     name: 'sqlite_query',
+    ...meta('Query SQLite database', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Run one read-only SQL statement on a SQLite file (sqlite3 -readonly -safe -json; ATTACH and other escapes are disabled). Must start with SELECT, WITH, VALUES, or EXPLAIN [QUERY PLAN] followed by one of those. Runs wrapped as SELECT * FROM (<sql>) LIMIT <limit+1>; truncated=true means more rows exist. ";" is allowed only inside string literals, quoted identifiers and comments, plus one trailing. Bind parameters (?, :x, @x, $x, #x) are rejected — write values as literals. EXPLAIN describes the wrapped statement. BLOBs are not converted — use hex(col) or length(col). A database with a -wal journal is read from a temporary copy (wal_copy in the response).',
     inputSchema: {
       type: 'object',
@@ -516,16 +536,19 @@ const TOOLS = [
   },
   {
     name: 'read_multiple_files',
+    ...meta('Read multiple files', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Read several whole files at once.',
     inputSchema: { type: 'object', properties: { paths: { type: 'array', items: { type: 'string' } } }, required: ['paths'] }
   },
   {
     name: 'write_file',
+    ...meta('Write file', { readOnly: false, destructive: true, idempotent: false, openWorld: false }),
     description: 'Create or overwrite a file with given content. In a zone with policy overwrite="rev", overwriting an EXISTING file requires its current rev (creating a new one does not); the refusal message carries the rev to use.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the file being overwritten. From grep_files, read_text_file offset, or get_file_info.' } }, required: ['path', 'content'] }
   },
   {
     name: 'edit_file',
+    ...meta('Edit file', { readOnly: false, destructive: true, idempotent: false, openWorld: false }),
     description: 'Edit a file. Two mutually exclusive edit shapes: {oldText,newText} literal replacement, or line edits (1-based). {startLine,endLine,newText} replaces the inclusive range; newText "" deletes, no trailing newline. Omitting endLine INSERTS before startLine instead of replacing, and startLine = lines+1 appends at EOF. Line edits require rev and are applied bottom-up in one atomic pass, so numbers from a single grep/read stay valid; a stale rev is rejected, never applied. Returns the new rev. dryRun shows the diff. In a zone with policy overwrite="rev" every edit needs rev, including {oldText}; in overwrite="never" zones editing is refused outright.',
     inputSchema: {
       type: 'object',
@@ -540,36 +563,43 @@ const TOOLS = [
   },
   {
     name: 'create_directory',
+    ...meta('Create directory', { readOnly: false, destructive: false, idempotent: true, openWorld: false }),
     description: 'Create a directory (and parents if needed).',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'list_directory',
+    ...meta('List directory', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'List files and directories in a path.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'list_directory_with_sizes',
+    ...meta('List directory with sizes', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'List a directory with file sizes, sorted by name or size.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, sortBy: { type: 'string', enum: ['name', 'size'] } }, required: ['path'] }
   },
   {
     name: 'directory_tree',
+    ...meta('Show directory tree', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Recursive tree view, 2 levels deep.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'move_file',
+    ...meta('Move or rename', { readOnly: false, destructive: true, idempotent: false, openWorld: false }),
     description: 'Move or rename a file or directory. Taking a file out of a zone with policy overwrite="rev" requires its current rev, exactly like overwriting it in place; directories are not moved out of a strict zone at all. Use trash_file, not this, to discard something.',
     inputSchema: { type: 'object', properties: { source: { type: 'string' }, destination: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the source file, required when it leaves a zone with overwrite="rev".' } }, required: ['source', 'destination'] }
   },
   {
     name: 'trash_file',
+    ...meta('Move to trash', { readOnly: false, destructive: true, idempotent: false, openWorld: false }),
     description: 'Discard a file by moving it into the trash of its own zone, keeping its relative path and adding an arrival timestamp to the name. There is no delete: this is the only way to remove something. Fails if the zone has no trash configured. In a zone with overwrite="rev" the current rev is required — you have to read a file before throwing it away.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, rev: { type: 'string', description: 'Current rev of the file, required in a zone with overwrite="rev".' } }, required: ['path'] }
   },
   {
     name: 'search_files',
+    ...meta('Find files by name', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Find files by NAME substring, recursively. For content use grep_files.',
     inputSchema: {
       type: 'object',
@@ -579,20 +609,20 @@ const TOOLS = [
   },
   {
     name: 'get_file_info',
+    ...meta('Get file info', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'Metadata for a file or directory: size, times, plus line count and rev for text files.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
     name: 'list_allowed_directories',
+    ...meta('List allowed directories', { readOnly: true, destructive: false, idempotent: true, openWorld: false }),
     description: 'List all directories this server is allowed to access.',
     inputSchema: { type: 'object', properties: {} }
   },
 ];
 
 async function callTool(name, args) {
-  // One memo per tool call: policy markers are read fresh every call, and
-  // within a call the same marker is not read twice. It dies with the call, so
-  // there is no stale cache anywhere.
+  // One memo per tool call: within a call the same marker is read once.
   const memo = new Map();
 
   switch (name) {
@@ -600,8 +630,7 @@ async function callTool(name, args) {
     case 'read_text_file': {
       const p = resolveSafe(args.path);
       let text = fs.readFileSync(p.path, 'utf8');
-      // offset/limit is the only branch that changes the response shape, and it
-      // is opt-in: head/tail and the plain read stay byte-identical to <=2.4.1.
+      // offset/limit is the only branch that changes the response shape.
       if (args.offset !== undefined || args.limit !== undefined) {
         const { lines } = splitLines(stripBom(text));
         const start = args.offset === undefined ? 1 : toInt(args.offset, 'offset');
@@ -613,12 +642,8 @@ async function callTool(name, args) {
         const head = `${p.path} · rev ${revOf(text)} · lines ${start}-${end} of ${lines.length}`;
         return [{ type: 'text', text: `${head}\n${lines.slice(start - 1, end).join('\n')}` }];
       }
-      // head/tail must slice the same line array as everything else. Until
-      // 2.5.1 they cut the raw split('\n'), where a trailing newline leaves a
-      // phantom empty element at the END: harmless for head, but it ate one
-      // slot of every tail=N on a file ending with a newline — that is, on
-      // nearly every file. splitLines() drops the phantom. Output is otherwise
-      // byte-identical to <=2.5.0, except that tail no longer trails a newline.
+      // head/tail slice the same line array as everything else: splitLines()
+      // drops the empty element a trailing newline would leave at the end.
       if (args.head) text = splitLines(text).lines.slice(0, args.head).join('\n');
       else if (args.tail) text = splitLines(text).lines.slice(-args.tail).join('\n');
       return [{ type: 'text', text }];
@@ -627,7 +652,7 @@ async function callTool(name, args) {
     case 'grep_files': {
       const root = resolveSafe(args.path);
       if (typeof args.pattern !== 'string' || !args.pattern) throw new Error('pattern must be a non-empty string');
-      // Fail fast and legibly on a broken regex instead of paying for a fork.
+      // A broken regex fails here, before a worker is forked.
       try { new RegExp(args.pattern); }
       catch (e) { throw new Error(`invalid regex: ${e.message}`); }
       const job = {
@@ -695,9 +720,8 @@ async function callTool(name, args) {
 
     case 'sqlite_schema': {
       const p = resolveSafe(args.path);
-      // opts is passed straight through with its tool-schema names (counts,
-      // counts_timeout_ms) — no renaming step, so there is nothing here to
-      // typo out of sync with sqlite.js or the inputSchema below.
+      // opts is passed through with its tool-schema names (counts,
+      // counts_timeout_ms).
       const { path, ...opts } = args;
       const result = await SQLITE.schema(p, opts);
       return [{ type: 'text', text: JSON.stringify(result, null, 2) }];
@@ -716,10 +740,10 @@ async function callTool(name, args) {
       for (const fp of paths) {
         try {
           const p = resolveSafe(fp);
-          // Bulk reads must not scoop discarded versions back into context.
-          // A single deliberate read_text_file still opens them.
-          const trash = P.trashDirOf(policyOfDir(parentDir(p), memo));
-          if (trash && P.inside(p.path, trash.path))
+          // Bulk reads skip the trash; read_text_file still opens it.
+          const zone = zoneOf(parentDir(p), memo);
+          const trash = P.trashDirOf(zone.policy);
+          if (trash && P.inside(realPathOf(p, zone), trash.path))
             throw new Error('this file is in the trash — bulk reads skip it; open it with read_text_file if you really want it');
           results.push(`=== ${fp} ===\n${fs.readFileSync(p.path, 'utf8')}`);
         }
@@ -730,10 +754,10 @@ async function callTool(name, args) {
 
     case 'write_file': {
       const p = resolveSafe(args.path);
-      const policy = guardWrite(p, memo, 'written');
-      const existed = guardOverwrite(p, policy, args.rev, 'overwritten');
-      // Both destinations are checked paths: p came from resolveSafe, its
-      // directory from parentDir (a resolveSafe of its own).
+      const zone = guardWrite(p, memo, 'written');
+      const existed = guardOverwrite(p, zone, args.rev, 'overwritten');
+      // Both destinations are checked paths: p from resolveSafe, its directory
+      // from parentDir.
       fs.mkdirSync(parentDir(p).path, { recursive: true });
       fs.writeFileSync(p.path, args.content, 'utf8');
       return [{ type: 'text', text: `${existed ? 'Overwritten' : 'Written'}: ${p.path} · rev ${revOf(args.content)}` }];
@@ -743,20 +767,17 @@ async function callTool(name, args) {
       const p = resolveSafe(args.path);
       const edits = coerceArray(args.edits, 'edits');
       const dry = args.dryRun === true || args.dryRun === 'true';
-      // The policy is checked for a dry run too: better to learn that the zone
-      // is locked before composing the edit than after.
-      const policy = guardWrite(p, memo, 'edited');
+      // The policy is checked for a dry run too.
+      const zone = guardWrite(p, memo, 'edited');
       let text = fs.readFileSync(p.path, 'utf8');
       const rev0 = revOf(text);
-      guardOverwrite(p, policy, args.rev, 'edited');
+      guardOverwrite(p, zone, args.rev, 'edited');
 
       const byLine = edits.some(e => e && (e.startLine !== undefined || e.endLine !== undefined));
       const byText = edits.some(e => e && e.oldText !== undefined);
       if (byLine && byText) throw new Error('do not mix {oldText} and {startLine} edits in one call — send two calls');
 
-      // Optimistic lock. Silently applying an edit against stale line numbers is
-      // the worst possible outcome (quiet corruption at an unreviewed spot), so
-      // a mismatch is a hard error and nothing is written.
+      // Optimistic lock: a rev mismatch is an error and nothing is written.
       if (args.rev !== undefined && String(args.rev) !== rev0)
         throw new Error(`rev mismatch: file is now ${rev0}, you passed ${args.rev}. It changed since you read it — NOTHING was written. Re-read (grep_files / read_text_file offset / get_file_info) and redo the edit.`);
 
@@ -769,15 +790,9 @@ async function callTool(name, args) {
         const norm = edits.map((e, i) => {
           if (!e || typeof e.newText !== 'string') throw new Error(`edit #${i + 1}: newText must be a string ("" deletes the lines)`);
           const s = toInt(e.startLine, `edit #${i + 1} startLine`);
-          // One shape, one meaning (2.5.2): omitting endLine INSERTS before
-          // startLine — the empty range startLine … startLine-1 — and
-          // startLine = lines+1 is that same insert landing at EOF, i.e. an
-          // append. Replacing a line requires an explicit endLine.
-          // Until 2.5.2 a missing endLine silently meant "replace line
-          // startLine", so an append aimed one line short quietly ate a line
-          // instead of adding one: the exact silent corruption that line
-          // addressing exists to prevent. Inserting into the middle of a file
-          // was impossible at the same time.
+          // Omitting endLine inserts before startLine (the empty range
+          // startLine … startLine-1); startLine = lines+1 is that insert at EOF,
+          // an append. Replacing a line requires an explicit endLine.
           const insert = e.endLine === undefined;
           const en = insert ? s - 1 : toInt(e.endLine, `edit #${i + 1} endLine`);
           if (s < 1) throw new Error(`edit #${i + 1}: bad startLine ${s} (1-based)`);
@@ -790,10 +805,8 @@ async function callTool(name, args) {
           }
           return { s, en, newText: e.newText, insert };
         }).sort((a, b) => b.s - a.s);
-        // Every pair is checked explicitly. An insert is an empty range, so the
-        // old "next.end < this.start" sweep would have let two inserts share one
-        // position (the bottom-up pass would silently swap them) and let an
-        // insert land inside a range being replaced (undefined whose text wins).
+        // Every pair is checked: an insert is an empty range, so two inserts at
+        // one position, or an insert inside a replaced range, are refused.
         for (let i = 0; i < norm.length; i++)
           for (let j = i + 1; j < norm.length; j++) {
             const a = norm[i], b = norm[j];
@@ -812,8 +825,7 @@ async function callTool(name, args) {
         for (const e of norm) {
           const removed = lines.slice(e.s - 1, e.en);
           // splitLines() cuts on \n only, so in a CRLF file every stored line
-          // still ends with \r. Inserted lines must carry it too, otherwise the
-          // file silently ends up with mixed line endings.
+          // still ends with \r; inserted lines get it too.
           const insLines = e.newText === '' ? []
             : e.newText.split('\n').map(l => crlf ? l.replace(/\r$/, '') + '\r' : l);
           if (dry) preview.unshift(
@@ -848,9 +860,8 @@ async function callTool(name, args) {
 
     case 'create_directory': {
       const p = resolveSafe(args.path);
-      // The marker-name check matters most here: a DIRECTORY named
-      // .vault-policy is unreadable as a marker, so the zone fails closed and
-      // cannot be repaired with these tools at all.
+      // A directory named .vault-policy would lock the zone; guardWrite refuses
+      // the name.
       guardWrite(p, memo, 'created');
       fs.mkdirSync(p.path, { recursive: true });
       return [{ type: 'text', text: `Created: ${p.path}` }];
@@ -858,25 +869,25 @@ async function callTool(name, args) {
 
     case 'list_directory': {
       const p = resolveSafe(args.path);
-      const policy = policyOfDir(p, memo);
-      const notes = orphanTrashNote(p, policy);
-      return [{ type: 'text', text: [P.describePolicy(policy, p.path), ...notes, '', listDir(p)].join('\n') }];
+      const zone = zoneOf(p, memo);
+      const notes = orphanTrashNote(p, zone);
+      return [{ type: 'text', text: [P.describePolicy(zone.policy, p.path, zone.real.path), ...notes, '', listDir(p)].join('\n') }];
     }
 
     case 'list_directory_with_sizes': {
       const p = resolveSafe(args.path);
-      const policy = policyOfDir(p, memo);
-      const notes = orphanTrashNote(p, policy);
-      return [{ type: 'text', text: [P.describePolicy(policy, p.path), ...notes, '', listDirWithSizes(p, args.sortBy)].join('\n') }];
+      const zone = zoneOf(p, memo);
+      const notes = orphanTrashNote(p, zone);
+      return [{ type: 'text', text: [P.describePolicy(zone.policy, p.path, zone.real.path), ...notes, '', listDirWithSizes(p, args.sortBy)].join('\n') }];
     }
 
     case 'directory_tree': {
       const p = resolveSafe(args.path);
-      const policy = policyOfDir(p, memo);
+      const zone = zoneOf(p, memo);
       const hidden = { n: 0 };
-      const body = dirTree(p, memo, policy, 0, hidden);
+      const body = dirTree(zone.real, memo, zone.policy, 0, hidden);
       const foot = hidden.n ? `\n\n(${hidden.n} trash director${hidden.n === 1 ? 'y' : 'ies'} omitted — reach one by its explicit path)` : '';
-      return [{ type: 'text', text: `${P.describePolicy(policy, p.path)}\n\n${body}${foot}` }];
+      return [{ type: 'text', text: `${P.describePolicy(zone.policy, p.path, zone.real.path)}\n\n${body}${foot}` }];
     }
 
     case 'move_file': {
@@ -887,25 +898,26 @@ async function callTool(name, args) {
       const st = fs.lstatSync(src.path);
 
       const srcDir = parentDir(src);
-      const srcPolicy = policyOfDir(srcDir, memo);
+      const srcZone = zoneOf(srcDir, memo);
+      const srcPolicy = srcZone.policy;
       if (srcPolicy.error) throw new Error(`Refused — ${srcPolicy.error}`);
       if (srcPolicy.readonly)
-        throw new Error(`Refused — ${srcDir.path} is read-only by policy (${P.describePolicy(srcPolicy, srcDir.path)}); nothing may leave it.`);
+        throw new Error(`Refused — ${srcZone.real.path} is read-only by policy (${P.describePolicy(srcPolicy, srcZone.real.path)}); nothing may leave it.`);
 
-      const dstPolicy = guardWrite(dst, memo, 'written');
+      const dstZone = guardWrite(dst, memo, 'written');
+      const dstPolicy = dstZone.policy;
 
-      // Discarding goes through trash_file, which stamps the name and keeps the
-      // relative path. A hand-rolled move into the trash would produce a file
-      // that the sweeper can never age out.
+      // Discarding goes through trash_file, which stamps the name the sweeper
+      // ages files by.
       const dstTrash = P.trashDirOf(dstPolicy);
-      if (dstTrash && P.inside(dst.path, dstTrash.path))
+      if (dstTrash && P.inside(realPathOf(dst, dstZone), dstTrash.path))
         throw new Error(`Refused — do not move things into the trash by hand; use trash_file, which stamps the arrival time and preserves the relative path.`);
 
       if (st.isDirectory()) {
         if (srcPolicy.overwrite !== 'free')
           throw new Error(`Refused — a directory cannot be taken out of a zone with policy "overwrite: ${srcPolicy.overwrite}": a directory has no content and therefore no rev to check. Move its files individually.`);
       } else {
-        guardTakeOut(src, srcPolicy, args.rev, 'moved');
+        guardTakeOut(src, srcZone, args.rev, 'moved');
       }
 
       if (fs.existsSync(dst.path)) {
@@ -929,21 +941,23 @@ async function callTool(name, args) {
       if (!st.isFile()) throw new Error(`${p.path} is not a regular file.`);
 
       const dir = parentDir(p);
-      const policy = policyOfDir(dir, memo);
+      const zone = zoneOf(dir, memo);
+      const policy = zone.policy;
       if (policy.error) throw new Error(`Refused — ${policy.error}`);
       if (policy.readonly)
-        throw new Error(`Refused — ${dir.path} is read-only by policy; a trash in a read-only zone would be meaningless and is ignored. Nothing was moved.`);
+        throw new Error(`Refused — ${zone.real.path} is read-only by policy; a trash in a read-only zone would be meaningless and is ignored. Nothing was moved.`);
 
       const trashDir = P.trashDirOf(policy);
       if (!trashDir)
-        throw new Error(`Refused — no trash is configured for this zone (${P.describePolicy(policy, dir.path)}), so nothing can be discarded here. Turn the trash on for the zone on the add-on's "Vault policies" page.`);
-      if (P.inside(p.path, trashDir.path)) throw new Error(`${p.path} is already in the trash.`);
+        throw new Error(`Refused — no trash is configured for this zone (${P.describePolicy(policy, zone.real.path)}), so nothing can be discarded here. Turn the trash on for the zone on the add-on's "Vault policies" page.`);
+      const at = realPathOf(p, zone);
+      if (P.inside(at, trashDir.path)) throw new Error(`${p.path} is already in the trash.`);
 
-      guardTakeOut(p, policy, args.rev, 'discarded');
+      guardTakeOut(p, zone, args.rev, 'discarded');
 
-      // Relative to the directory that OWNS the trash, so wiki/system/foo.md
-      // lands at wiki/.vault-trash/system/foo.md and stays identifiable.
-      const rel = path.relative(policy.trashOwner.path, p.path);
+      // Relative to the directory that owns the trash: wiki/system/foo.md lands
+      // at wiki/.vault-trash/system/foo.md.
+      const rel = path.relative(policy.trashOwner.path, at);
       const stamp = P.stampNow();
       const destOf = n => path.join(trashDir.path, path.dirname(rel), P.stampName(path.basename(p.path), n));
       let destPath = destOf(stamp);
@@ -951,10 +965,8 @@ async function callTool(name, args) {
         destPath = destOf(`${stamp}-${i}`);
         if (i > 50) throw new Error('cannot find a free name in the trash');
       }
-      // The trash directory comes from a marker, not from a readdir, so the
-      // path above is only lexically inside the vault: on 2.7.3 a trash that
-      // was a symlink out of the vault moved the file clean out of it. The
-      // destination is checked for real before anything is created or moved.
+      // The trash name comes from a marker, so the destination is checked
+      // against the vault before anything is created or moved.
       const dest = resolveSafe(destPath);
       fs.mkdirSync(parentDir(dest).path, { recursive: true });
       fs.renameSync(p.path, dest.path);
@@ -969,17 +981,22 @@ async function callTool(name, args) {
       const exclude = coerceArray(args.excludePatterns || [], 'excludePatterns');
       const results = [];
       let hiddenTrash = 0;
+      // Walked over the real place (see grepRun); matched and printed by the
+      // path as requested.
+      const zone = zoneOf(base, memo);
+      const shown = full => base.path + full.path.slice(zone.real.path.length);
       function walk(dir, policy) {
         const trash = P.trashDirOf(policy);
         for (const e of fs.readdirSync(dir.path, { withFileTypes: true })) {
           if (exclude.some(ex => e.name.includes(ex))) continue;
           const full = SP.child(dir, e.name);
           if (e.isDirectory() && trash && full.path === trash.path) { hiddenTrash++; continue; }
-          if (e.name.includes(args.pattern) || full.path.includes(args.pattern)) results.push(full.path);
+          const p = shown(full);
+          if (e.name.includes(args.pattern) || p.includes(args.pattern)) results.push(p);
           if (e.isDirectory()) walk(full, P.applyMarker(policy, full, memo));
         }
       }
-      walk(base, policyOfDir(base, memo));
+      walk(zone.real, zone.policy);
       const foot = hiddenTrash ? `\n\n(${hiddenTrash} trash director${hiddenTrash === 1 ? 'y' : 'ies'} not searched)` : '';
       return [{ type: 'text', text: (results.join('\n') || 'No matches') + foot }];
     }
@@ -988,8 +1005,7 @@ async function callTool(name, args) {
       const p = resolveSafe(args.path);
       const s = fs.statSync(p.path);
       const info = { path: p.path, size: s.size, isFile: s.isFile(), isDirectory: s.isDirectory(), created: s.birthtime, modified: s.mtime };
-      // lines/rev only for text files small enough to hash cheaply; a binary or
-      // a huge blob just gets the old field set.
+      // lines/rev only for text files up to GREP_MAX_FILE.
       if (s.isFile() && s.size <= GREP_MAX_FILE) {
         try {
           const buf = fs.readFileSync(p.path);
@@ -1011,12 +1027,47 @@ async function callTool(name, args) {
   }
 }
 
+// The client's version is echoed when supported, otherwise the newest one.
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+
+function negotiateProtocolVersion(requested) {
+  return SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : SUPPORTED_PROTOCOL_VERSIONS[0];
+}
+
+// MCP-Protocol-Version header check. Returns null when the request may
+// proceed, or the JSON-RPC error body for a 400. No header passes; initialize
+// (alone or inside a batch) is never checked, its version is not agreed yet.
+function protocolHeaderError(rawHeaders, body) {
+  const items = Array.isArray(body) ? body : [body];
+  if (items.some(r => r && typeof r === 'object' && r.method === 'initialize')) return null;
+  const values = [];
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    if (String(rawHeaders[i]).toLowerCase() === 'mcp-protocol-version') values.push(String(rawHeaders[i + 1]));
+  }
+  if (!values.length) return null;
+  if (values.length === 1 && SUPPORTED_PROTOCOL_VERSIONS.includes(values[0])) return null;
+  return { jsonrpc: '2.0', id: null, error: { code: -32600,
+    message: `Unsupported MCP-Protocol-Version: ${values.join(', ').slice(0, 40)}. Supported: ${SUPPORTED_PROTOCOL_VERSIONS.join(', ')}` } };
+}
+
+// Accept is split on commas, parameters (;q=...) dropped, case ignored.
+// An empty or missing header is not accepted.
+const ACCEPTED_MEDIA = new Set(['application/json', 'text/event-stream', 'application/*', '*/*']);
+
+function acceptsMcp(header) {
+  return String(header || '').split(',')
+    .map(part => part.split(';')[0].trim().toLowerCase())
+    .some(type => ACCEPTED_MEDIA.has(type));
+}
+
 async function handleMcpRequest(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body))
+    return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request: each request must be a JSON object' } };
   const { id, method, params } = body;
 
   if (method === 'initialize') {
     return { jsonrpc: '2.0', id, result: {
-      protocolVersion: '2024-11-05',
+      protocolVersion: negotiateProtocolVersion(params && params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: 'vault-mcp-server', version: VERSION }
     }};
@@ -1032,8 +1083,7 @@ async function handleMcpRequest(body) {
   if (method === 'tools/call') {
     try {
       const content = await callTool(params.name, params.arguments || {});
-      // Issue #3: no structuredContent — tools declare no outputSchema, and
-      // duplicating content into it doubled the payload for base64 media.
+      // No structuredContent: the tools declare no outputSchema.
       return { jsonrpc: '2.0', id, result: { content } };
     } catch (e) {
       return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true } };
@@ -1050,20 +1100,14 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // POST /write was removed in 2.6.0. It wrote any file, with no rev check and
-  // no token of its own, and the blind prefix proxy forwarded it straight from
-  // the internet — one curl and every policy below is moot. Its only consumer
-  // was a weekly snapshot that overwrote itself and kept no history.
+  // /mcp is the only route.
   if (req.url !== '/mcp') { res.writeHead(404); res.end('Not found'); return; }
 
-  // Issue #4: this server never sends server-initiated notifications, so per
-  // the MCP Streamable HTTP spec we decline the GET SSE channel with 405
-  // instead of holding a dead stream open (which hangs clients waiting on it
-  // and starves buffering proxies like cloudflared of any bytes at all).
+  // The server sends no notifications, so the GET SSE channel is declined with
+  // 405 (allowed by the Streamable HTTP transport).
   if (req.method !== 'POST') { res.writeHead(405, { 'Allow': 'POST, OPTIONS' }); res.end(); return; }
 
-  const accept = req.headers['accept'] || '';
-  if (!accept.includes('application/json') && !accept.includes('text/event-stream')) {
+  if (!acceptsMcp(req.headers['accept'])) {
     res.writeHead(406);
     res.end(JSON.stringify({ error: 'Not Acceptable: Client must accept application/json or text/event-stream' }));
     return;
@@ -1072,29 +1116,44 @@ const server = http.createServer(async (req, res) => {
   const chunks = [];
   req.on('data', c => chunks.push(c));
   req.on('end', async () => {
-    let body;
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-    catch { res.writeHead(400); res.end('Bad JSON'); return; }
-
-    const requests = Array.isArray(body) ? body : [body];
-    const responses = [];
-    for (const r of requests) {
-      const resp = await handleMcpRequest(r);
-      if (resp !== null) responses.push(resp);
+    try {
+      await answer(req, res, chunks);
+    } catch (e) {
+      // An unexpected exception answers 500; the process keeps serving.
+      process.stderr.write(`request failed: ${e && e.stack || e}\n`);
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error' } }));
     }
-
-    const result = Array.isArray(body) ? responses : (responses[0] || null);
-    if (result === null) { res.writeHead(202); res.end(); return; }
-
-    // Issue #4: plain JSON instead of a single-event SSE response. The spec
-    // allows either ("the server MUST either return Content-Type:
-    // text/event-stream ... or Content-Type: application/json"), and JSON is
-    // immune to SSE buffering in tunnels (cloudflare/cloudflared#1449) that
-    // may truncate large base64 payloads such as read_pdf_page images.
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(result));
   });
 });
+
+async function answer(req, res, chunks) {
+  let body;
+  try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { res.writeHead(400); res.end('Bad JSON'); return; }
+
+  const versionError = protocolHeaderError(req.rawHeaders, body);
+  if (versionError) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(versionError));
+    return;
+  }
+
+  const requests = Array.isArray(body) ? body : [body];
+  const responses = [];
+  for (const r of requests) {
+    const resp = await handleMcpRequest(r);
+    if (resp !== null) responses.push(resp);
+  }
+
+  const result = Array.isArray(body) ? responses : (responses[0] || null);
+  if (result === null) { res.writeHead(202); res.end(); return; }
+
+  // Plain JSON, not SSE: the transport allows either, and JSON is not
+  // affected by SSE buffering in tunnels.
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(result));
+}
 
 if (GREP_WORKER) {
   // Forked child: do one grep job, answer, exit. Never binds a port.
@@ -1107,7 +1166,7 @@ if (GREP_WORKER) {
   });
   // Do not outlive a parent that went away.
   process.on('disconnect', () => process.exit(0));
-} else {
+} else if (require.main === module) {
   server.listen(PORT, () => {
     process.stderr.write(`Vault MCP Server v${VERSION} on port ${PORT}, allowed: ${ALLOWED_DIR}\n`);
   });
@@ -1115,3 +1174,8 @@ if (GREP_WORKER) {
   // a day after that.
   require('./retention').start(R.root);
 }
+
+module.exports = {
+  TOOLS, handleMcpRequest, server, acceptsMcp,
+  negotiateProtocolVersion, SUPPORTED_PROTOCOL_VERSIONS, protocolHeaderError,
+};

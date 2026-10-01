@@ -4,6 +4,8 @@ Every tool the server offers, with its parameters and what it returns. Look here
 
 All paths are absolute paths inside `vault_path`. A path outside the vault is refused with the code `PATH_OUTSIDE_VAULT`, and nothing is read or written. That covers a path that simply points elsewhere, one that climbs out with `..`, one that reaches a sibling directory whose name merely starts with the vault's own, and one that resolves out through a symlink — including the case where the symlink leads back inside, which is checked at the destination of every write. An error comes back as a normal tool result with `isError: true` and text starting with `Error: `.
 
+Every tool has a title and MCP annotations. `write_file`, `edit_file`, `move_file` and `trash_file` are marked destructive; `create_directory` changes the vault but is not destructive; every other tool is marked read-only. A client can use these marks to decide whether to ask for confirmation before running a tool.
+
 ## Reading
 
 ### `read_text_file`
