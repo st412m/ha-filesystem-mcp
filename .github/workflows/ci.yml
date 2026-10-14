@@ -8,23 +8,23 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [22, 24]
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
-      - name: Syntax check
-        run: for f in filesystem_mcp/*.js; do node --check "$f"; done
-      # The glob is quoted: node expands it itself.
-      - name: Tests
-        run: node --test "test/*.test.js"
-      - name: Documentation examples
-        run: node tools/check-doc-examples.mjs
-      - name: Secret scan
-        run: node tools/scan-secrets.mjs
+          node-version: 24
+      # run.sh runs under bashio (bash); shellcheck comes with the runner image.
+      - name: Shell
+        run: shellcheck filesystem_mcp/run.sh
+      - name: YAML
+        run: >-
+          pipx run yamllint==1.38.0 --strict
+          -d "{extends: default, rules: {document-start: disable,
+          line-length: {max: 120}, truthy: {check-keys: false}}}"
+          repository.yaml filesystem_mcp/config.yaml .github/workflows/ci.yml
+      # config.yaml version = top CHANGELOG entry; Dockerfile pin = the Everkeep
+      # version that entry names.
+      - name: Release consistency
+        run: node tools/check-release.mjs

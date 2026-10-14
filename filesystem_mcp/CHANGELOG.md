@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.0.0 — 2026-10-14
+
+The server is now [Everkeep](https://github.com/st412m/everkeep), a separate package this app installs. The connector URL, the 20 tool names, the options, the markers and the Vault policies page stay as they were.
+
+Server: everkeep 1.0.0
+
+### Added
+- Documents: PDF, Word, Excel, PowerPoint, OpenDocument, EPUB, FB2, RTF, HTML and mail files read as numbered lines with page, sheet and slide markers, and are searched by `grep_files`. A scanned PDF names the pages to read as images with `read_pdf_page`. Documents are read-only.
+- `Authorization: Bearer <token>` on `/mcp` as a second way in, for clients that send headers.
+- An empty `token` option: the app generates a token, writes it into the option and shows the connector path once in the log. Clearing the option and restarting gives a new token and a new connector URL.
+
+### Changed
+- The `token` option is empty by default. A token of 2.x left at `changeme` is replaced with a generated one on the first start, with a warning: the connector URL changes. A token shorter than 32 characters, or with characters other than `A-Z a-z 0-9 . _ ~ -`, keeps working, with a warning on every start.
+- `serverInfo.name` is `everkeep`.
+- Refusals name the Vault policies page and advise fixing a file on disk, instead of naming Samba.
+- `read_pdf_text` returns numbered lines with page markers, the same numbers as `read_text_file`; `get_file_info` has a `format` field.
+- Saving a directory on the Vault policies page writes only what the directory sets itself: a subdirectory below one with a trash shares that trash instead of getting its own.
+- Node.js 24 in the image (Alpine 3.24).
+- The document cache in `/data/doc-cache` is left out of Home Assistant backups.
+- One process instead of three; the internal port 3099 is gone.
+
+### Fixed
+- On a vault whose file system ignores letter case, a marker or a trash written in another case is now recognized as the marker or the trash.
+- A directory named like the policy marker can no longer be created anywhere in a path.
+
 ## 2.9.0 — 2026-10-01
 
 Policies follow the real place of a directory reached through a symlink, tools carry titles and annotations, the protocol version is negotiated, and the Vault policies page can be limited to listed users.

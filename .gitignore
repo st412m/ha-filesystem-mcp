@@ -8,3 +8,5 @@ venv/
 .DS_Store
 sqlite-spec.md
 sqlite-spec-272.md
+# npm pack tarballs for Dockerfile.local
+*.tgz

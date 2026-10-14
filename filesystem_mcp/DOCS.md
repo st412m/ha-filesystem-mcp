@@ -1,31 +1,47 @@
 # Filesystem MCP Server
 
-An MCP server over Streamable HTTP that gives an assistant read and write access to one directory tree, the "vault": text and PDF reading, regex content search, line-addressed editing with an optimistic lock, and read-only SQLite. This page covers running the app. The full reference is on GitHub: [documentation index](https://github.com/st412m/ha-filesystem-mcp/tree/main/docs).
+Runs [Everkeep](https://github.com/st412m/everkeep), an MCP server that gives an AI assistant read and write access to one directory tree, the "vault", under write policies it cannot change: text, documents and PDFs, regex search, line edits guarded by `rev`, read-only SQLite. Put contracts, invoices, manuals and spreadsheets into the vault as they are — PDF, Word, Excel, e-mails — and the assistant reads and searches them and says on which page it found the answer. This page covers running the app. The full reference is in the [Everkeep documentation](https://github.com/st412m/everkeep/tree/main/docs).
 
-## Configuration
+## Options
 
 | Option | Default | What it does |
 |---|---|---|
-| `token` | `changeme` | Secret in the URL path. Change it before exposing the port. |
+| `token` | empty | The secret in the connector URL. Leave it empty: the app generates one. |
 | `vault_path` | `/media/VAULT` | The one directory the server may touch, under `/media` or `/share`. |
 | `log_requests` | `false` | Log every request (method, path with the token masked, status, bytes, `MCP-Protocol-Version` header, user agent). |
 | `policy_page_users` | `[]` | Home Assistant users allowed to open the Vault policies page, by user name or user ID. Empty: every Home Assistant user. |
 
-Restart the app after changing an option.
+Restart the app after changing an option, then reload the Configuration tab and check that the value stayed: an option that was typed but not saved looks the same until then. The start line in the log shows the vault in force: `everkeep 1.0.0 on 0.0.0.0:3100, vault /media/VAULT, …`.
 
-The endpoint is `/private_<token>/mcp` on port 3100. For claude.ai, publish port 3100 through a reverse proxy that terminates TLS and use `https://<your-host>/private_<token>/mcp` as the connector URL. Only `/mcp` is served; a wrong token gets 401, any other path 404.
+## The token
 
-Ports `3099` (the MCP server) and `3101` (the Vault policies page) are internal.
+- **Empty field:** on the next start the app generates a token, writes it into the field and shows the connector path and the Bearer line once in the log.
+- **New token:** clear the field and restart. The connector URL changes: update it in every client.
+- **Your own token** must be at least 32 characters of `A-Z a-z 0-9 . _ ~ -`.
+- **A token from 2.x:** `changeme` is replaced with a generated token on the first start of 3.0 (the log warns; the connector URL changes). A shorter token or one with other characters keeps working, with a warning in the log on every start; clear the field to get a generated one.
 
-More: [configuration](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/configuration.md).
+If the app cannot write the field, the token stays in the app's data and the log says so.
+
+## Connecting
+
+The server listens on port 3100.
+
+- **claude.ai and the Claude apps:** add a custom connector (**Settings → Connectors → Add custom connector**) with `https://<your-host>/private_<token>/mcp`. claude.ai connects from the internet, so publish port 3100 through a tunnel or a reverse proxy that terminates TLS; never without TLS. See [remote access](https://github.com/st412m/everkeep/blob/main/docs/remote-access.md).
+- **Claude Code, Cursor and other clients:** `http://<ha-host>:3100/mcp` with the header `Authorization: Bearer <token>`.
+
+A wrong path or token gets an empty 404, a wrong Bearer token 401.
+
+## Where to put the vault
+
+The app maps `/media` and `/share` read-write. To put files into the vault from your computer, use the Home Assistant Samba share app: the vault is the folder named in `vault_path` inside its share `media` or `share` ([putting your files in](https://github.com/st412m/everkeep/blob/main/docs/your-files.md#home-assistant)). A USB drive formatted as ext4 appears under `/media` once mounted (for example by the Samba NAS app); `/share` lives on the same disk as Home Assistant itself. A drive formatted as exFAT or NTFS works too: Everkeep keeps its policies on file systems that ignore letter case.
 
 ## Fresh install
 
 On the first start into a vault without `CLAUDE.md`, the app creates `raw/ha`, `raw/projects`, `wiki/ha/{devices,automations,network}`, `wiki/projects`, a starter `CLAUDE.md` and `log.md`. This happens once. A directory deleted afterwards stays deleted, and an existing vault is never re-seeded.
 
-## Write policies
+## Vault policies page
 
-With no policies, any tool may write anywhere in the vault. To restrict a directory, open **Vault policies** in the Home Assistant sidebar and choose a mode for it. The rule applies to the directory and everything below it until a deeper marker overrides it.
+With no policies, any tool may write anywhere in the vault. To restrict a directory, open **Vault policies** in the sidebar and choose a mode for it. The rule applies to the directory and everything below it until a deeper marker overrides it.
 
 | Mode | Effect |
 |---|---|
@@ -35,58 +51,29 @@ With no policies, any tool may write anywhere in the vault. To restrict a direct
 | free writes | no checks |
 | new files only | existing files may not be changed |
 
-**Edits with rev** is the mode for a wiki. A refusal always states the current `rev`, so the retry succeeds.
+A directory saved below one that has a trash shares that trash; the page shows which one. Auto-purge erases files older than the set number of days from a zone's trash, shortly after start and then daily.
 
-Put policies on the top-level directories; the page shows only the root and what sits directly in it. Markers placed deeper by hand are listed with a button to remove them.
+**A broken marker locks its zone.** A `.vault-policy` that is not valid JSON, or carries a field the app does not know, stops all writes and deletion in its whole subtree. Reading keeps working, and the listing tools print `⚠ Policy: BROKEN MARKER`. Fix the marker on the page, or the file on disk.
 
-**Trash.** There is no delete. With the trash switched on for a zone, `trash_file` moves a file into `.vault-trash`, keeping its relative path and stamping the arrival time (UTC) into the name. Trash contents drop out of searches and listings but stay readable by explicit path. A zone with no trash cannot discard anything.
+Home Assistant shows the Vault policies entry in the sidebar to administrators only, but serves the page itself to any logged-in user who opens its address. To restrict it, list your user name (Settings → People → Users; the Users tab is shown only with Advanced mode turned on in your user profile) in `policy_page_users`; any other user gets 403.
 
-**Auto-purge** is off by default. When enabled, files older than the set number of days are erased from that zone's trash, one at a time, shortly after start and then daily. Files without an arrival stamp are never touched. If your backup is a mirror without history, a purge also removes the file from the backup at its next run.
+Policies stop the app's tools only. Samba, the file editor or a `shell_command` write straight to the filesystem and never see a marker.
 
-**A broken marker locks its zone.** A `.vault-policy` that is not valid JSON, or carries a field the app does not know, stops all writes and deletion in its whole subtree, including subdirectories with valid markers. Reading keeps working, and the listing tools print `⚠ Policy: BROKEN MARKER`. A broken marker at the vault root locks the entire vault, so the assistant cannot even write its log. Fix the marker first: on the Vault policies page, or over Samba or with the file editor.
+More: [write policies](https://github.com/st412m/everkeep/blob/main/docs/policies.md).
 
-**Policies stop this app's tools only.** Samba, the file editor or a `shell_command` write straight to the filesystem and never see a marker.
+## Upgrading from 2.x
 
-More: [write policies](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/policies.md).
+- The connector URL stays the same unless the token was `changeme`.
+- The 20 tools keep their names; existing markers and trash keep working; the vault is not seeded again.
+- New: documents (PDF, Word, Excel and more) read as text, `Authorization: Bearer` as a second way in, refusals that name the policy editor instead of Samba.
+- After the update, refresh the connector's tool list in the client and start a new chat.
 
-## Tools
+## Backups
 
-- Reading: `read_text_file`, `read_file` (deprecated alias), `read_multiple_files`, `read_media_file`, `read_pdf_text`, `read_pdf_page`
-- Searching: `grep_files`, `search_files`
-- Writing: `write_file`, `edit_file`, `create_directory`, `move_file`, `trash_file`
-- Listing: `list_directory`, `list_directory_with_sizes`, `directory_tree`, `get_file_info`, `list_allowed_directories`
-- SQLite: `sqlite_schema`, `sqlite_query`
-
-Read files one at a time: `read_multiple_files` returns every file whole in one response.
-
-More: [tools](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/tools.md), [search and editing](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/search-and-edit.md).
-
-## If the tool list looks wrong
-
-After an update, a client may keep offering the tools and parameters it fetched earlier. Refresh the connector's tool list in the client, then start a new chat. The quick test is `write_file`: if it has no `rev` parameter, the client holds an outdated schema. Do not go by the number of tools; it changes between releases.
-
-More: [troubleshooting](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/troubleshooting.md).
-
-## SQLite
-
-`sqlite_schema` and `sqlite_query` run `sqlite3 -readonly -safe`: nothing is written, and `ATTACH` and the other ways out of the vault through SQL are disabled. A database with a non-empty `-wal` journal is read from a private copy that is removed after the call; without one it is opened in place. Either way no file is left next to the original.
-
-`sqlite_query` accepts one statement starting with `SELECT`, `WITH`, `VALUES` or `EXPLAIN`. `EXPLAIN` and `EXPLAIN QUERY PLAN` must be followed by a `SELECT`, `WITH` or `VALUES` of their own; the modifier is lifted outside the wrapper, so the plan describes the wrapped statement and gains rows the bare query would not have (`CO-ROUTINE`, `SCAN (subquery-N)`), and `limit` is applied only after sqlite has produced the whole listing, so a very large plan hits `OUTPUT_TOO_LARGE` with no partial result. The statement is tokenized before `sqlite3` runs, so a `;` inside a string literal, a quoted identifier or a comment is accepted, and only a `;` that really ends a statement is refused with `MULTIPLE_STATEMENTS`. Bind parameters (`?`, `:x`, `@x`, `$x`, `#x`) are refused with `PARAMETERS_NOT_SUPPORTED` — there is nothing to bind them to, so write the value into the SQL as a literal. Unterminated literals and comments and unbalanced parentheses are refused with `MALFORMED_SQL` before `sqlite3` starts.
-
-Every call runs under a 256 MiB working-memory limit. A query that needs more is stopped with `QUERY_TOO_LARGE`; if the `sqlite3` build does not confirm the limit, the query is refused with `HEAP_LIMIT_UNCONFIRMED`.
-
-The first time you read a database, note a row count or a total and re-check it after updates: a wrong answer from a database looks like a normal result.
-
-More: [sqlite](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/sqlite.md).
-
-## Security
-
-Anyone holding the token URL has full access to the vault, so treat it as a password and put TLS in front of the port if it leaves the LAN. The proxy passes only `/mcp` through. The Vault policies page runs as a separate process on an internal port, reachable only through Home Assistant ingress, never through the token URL.
-
-Home Assistant shows the Vault policies entry in the sidebar to administrators only, but serves the page itself to any logged-in user who opens its address. To restrict the page, list your user name (Settings → People → Users; the Users tab is shown only with Advanced mode turned on in your user profile) in `policy_page_users`; any other user gets 403. With an empty list the page is open to every Home Assistant user, and the app log says so at start.
+Home Assistant backups of the app include the token and settings, not the document cache, which is rebuilt when needed.
 
 ## Links
 
+- [Everkeep documentation](https://github.com/st412m/everkeep/tree/main/docs): [tools](https://github.com/st412m/everkeep/blob/main/docs/tools.md), [documents](https://github.com/st412m/everkeep/blob/main/docs/documents.md), [sqlite](https://github.com/st412m/everkeep/blob/main/docs/sqlite.md), [security](https://github.com/st412m/everkeep/blob/main/docs/security.md), [troubleshooting](https://github.com/st412m/everkeep/blob/main/docs/troubleshooting.md)
 - [Changelog](https://github.com/st412m/ha-filesystem-mcp/blob/main/filesystem_mcp/CHANGELOG.md)
-- [Internals](https://github.com/st412m/ha-filesystem-mcp/blob/main/docs/internals.md)
 - [License (MIT)](https://github.com/st412m/ha-filesystem-mcp/blob/main/LICENSE)

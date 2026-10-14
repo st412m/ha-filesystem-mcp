@@ -1,0 +1,39 @@
+# Development build, not used by the Supervisor in production: the same image
+# as Dockerfile, but Everkeep comes from a tarball made by `npm pack` (its
+# dependencies still come from npm).
+#
+# 1. In the Everkeep repository: npm pack, then put everkeep-1.0.0.tgz next to
+#    this file.
+# 2. Copy this folder to the Home Assistant /addons share under another name,
+#    change name and slug in that copy's config.yaml, and replace its
+#    Dockerfile with this file (the Supervisor builds Dockerfile.<arch> or
+#    Dockerfile, nothing else).
+# 3. App store > ⋮ > Check for updates; install the app from "Local apps".
+#    New tarball: copy it again, then Rebuild.
+FROM ghcr.io/home-assistant/base:3.24-2026.08.0
+
+ARG BUILD_VERSION=0.0.0-dev
+ENV APP_VERSION=${BUILD_VERSION}
+
+COPY everkeep-1.0.0.tgz /tmp/
+RUN apk add --no-cache nodejs npm poppler-utils sqlite jq \
+    && mkdir -p /opt/everkeep \
+    && cd /opt/everkeep \
+    && npm install --ignore-scripts --omit=optional --no-package-lock --no-save /tmp/everkeep-1.0.0.tgz \
+    && ln -s /opt/everkeep/node_modules/.bin/everkeep /usr/local/bin/everkeep \
+    && npm cache clean --force \
+    && rm /tmp/everkeep-1.0.0.tgz \
+    && { rmdir /opt/everkeep/node_modules/@napi-rs 2>/dev/null || true; } \
+    && ! test -e /opt/everkeep/node_modules/@napi-rs \
+    && apk del npm \
+    && sh /opt/everkeep/node_modules/everkeep/scripts/toolchain-check.sh build
+
+COPY run.sh /run.sh
+RUN chmod a+x /run.sh
+
+LABEL \
+  io.hass.version="${BUILD_VERSION}" \
+  io.hass.type="addon" \
+  io.hass.arch="amd64|aarch64"
+
+CMD [ "/run.sh" ]
