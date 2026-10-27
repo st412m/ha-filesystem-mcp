@@ -11,7 +11,7 @@ Runs [Everkeep](https://github.com/st412m/everkeep), an MCP server that gives an
 | `log_requests` | `false` | Log every request (method, path with the token masked, status, bytes, `MCP-Protocol-Version` header, user agent). |
 | `policy_page_users` | `[]` | Home Assistant users allowed to open the Vault policies page, by user name or user ID. Empty: every Home Assistant user. |
 
-Restart the app after changing an option, then reload the Configuration tab and check that the value stayed: an option that was typed but not saved looks the same until then. The start line in the log shows the vault in force: `everkeep 1.0.0 on 0.0.0.0:3100, vault /media/VAULT, …`.
+Restart the app after changing an option, then reload the Configuration tab and check that the value stayed: an option that was typed but not saved looks the same until then. The start line in the log shows the vault in force: `everkeep 1.1.0 on 0.0.0.0:3100, vault /media/VAULT, …`.
 
 ## The token
 
@@ -64,7 +64,8 @@ More: [write policies](https://github.com/st412m/everkeep/blob/main/docs/policie
 ## Upgrading from 2.x
 
 - The connector URL stays the same unless the token was `changeme`.
-- The 20 tools keep their names; existing markers and trash keep working; the vault is not seeded again.
+- The tools keep their names, except `read_file`, the old alias of `read_text_file`, which is gone since 3.1.0; existing markers and trash keep working; the vault is not seeded again.
+- Since 3.1.0 `read_media_file` no longer takes a PDF page (`plan.pdf#3`); a PDF page as a picture is `read_pdf_page`.
 - New: documents (PDF, Word, Excel and more) read as text, `Authorization: Bearer` as a second way in, refusals that name the policy editor instead of Samba.
 - After the update, refresh the connector's tool list in the client and start a new chat.
 

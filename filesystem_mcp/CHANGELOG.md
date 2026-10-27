@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.1.0 — 2026-10-27
+
+Server: everkeep 1.1.0
+
+### Added
+- Claude and other clients on the new MCP protocol revision (2026-07-28) connect without the old handshake; clients on earlier revisions work as before. The connector URL does not change.
+- `copy_file`: copies a file inside the vault, following the same write policies as `write_file`.
+
+### Removed
+- `read_file`, the old alias of `read_text_file`. Still 20 tools; refresh the connector's tool list in the client after the update.
+- The page number after `#` in `read_media_file` (`plan.pdf#3`): a PDF page as a picture is `read_pdf_page`.
+
+### Changed
+- Some malformed emails are read more completely.
+
+### Fixed
+- Pictures with `#` in the file name open with `read_media_file`.
+
+### Security
+- Mail parser update (postal-mime 4.1.4, GHSA-f2hq-32vh-53cc).
+
 ## 3.0.0 — 2026-10-14
 
 The server is now [Everkeep](https://github.com/st412m/everkeep), a separate package this app installs. The connector URL, the 20 tool names, the options, the markers and the Vault policies page stay as they were.

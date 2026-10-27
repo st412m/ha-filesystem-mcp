@@ -1,7 +1,5 @@
 # Home Assistant app image. The Supervisor builds it from this folder; the
-# server, Everkeep, comes from npm, pinned below. Release: publish everkeep
-# first, then change the pin here, `version` in config.yaml and the top entry
-# of CHANGELOG.md together (tools/check-release.mjs).
+# server, Everkeep, comes from npm, pinned below.
 FROM ghcr.io/home-assistant/base:3.24-2026.08.0
 
 # The version has one source: config.yaml -> BUILD_VERSION (passed by the
@@ -27,7 +25,7 @@ ENV APP_VERSION=${BUILD_VERSION}
 RUN apk add --no-cache nodejs npm poppler-utils sqlite jq \
     && mkdir -p /opt/everkeep \
     && cd /opt/everkeep \
-    && npm install --ignore-scripts --omit=optional --no-package-lock --no-save everkeep@1.0.0 \
+    && npm install --ignore-scripts --omit=optional --no-package-lock --no-save everkeep@1.1.0 \
     && ln -s /opt/everkeep/node_modules/.bin/everkeep /usr/local/bin/everkeep \
     && npm cache clean --force \
     && { rmdir /opt/everkeep/node_modules/@napi-rs 2>/dev/null || true; } \
