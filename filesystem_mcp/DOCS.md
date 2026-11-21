@@ -33,7 +33,7 @@ A wrong path or token gets an empty 404, a wrong Bearer token 401.
 
 ## Where to put the vault
 
-The app maps `/media` and `/share` read-write. To put files into the vault from your computer, use the Home Assistant Samba share app: the vault is the folder named in `vault_path` inside its share `media` or `share` ([putting your files in](https://github.com/st412m/everkeep/blob/main/docs/your-files.md#home-assistant)). A USB drive formatted as ext4 appears under `/media` once mounted (for example by the Samba NAS app); `/share` lives on the same disk as Home Assistant itself. A drive formatted as exFAT or NTFS works too: Everkeep keeps its policies on file systems that ignore letter case.
+The app maps `/media` and `/share` read-write. To put files into the vault from your computer, use the Home Assistant Samba share app: the vault is the folder named in `vault_path` inside its share `media` or `share` ([putting your files in](https://github.com/st412m/everkeep/blob/main/docs/your-files.md#home-assistant)). To keep the vault on its own internal or USB drive, add the drive under Settings > System > Storage > Add storage, with the type Local disk and the usage Media (Home Assistant 2026.11 or later): a drive added with the name `VAULT` appears as `/media/VAULT`, the default `vault_path`. The drive must already be formatted; the supported file systems are listed in [local disk storage](https://www.home-assistant.io/common-tasks/os/#local-disk-storage). On older versions, any app that mounts the drive under `/media` works. `/share` lives on the same disk as Home Assistant itself. On exFAT or NTFS, which ignore letter case, Everkeep still keeps its policies.
 
 ## Fresh install
 
