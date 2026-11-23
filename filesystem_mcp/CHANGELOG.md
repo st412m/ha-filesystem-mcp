@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.2.0 — 2026-11-23
+
+Server: everkeep 1.2.0
+
+### Added
+- A fresh install writes what `everkeep init` writes: a starter `CLAUDE.md`, from which the assistant sets the vault up with you, and a root write policy (edits need the current rev, discarded files go to `.vault-trash`) unless the vault has one. Once per installation; a vault with `CLAUDE.md` or `AGENTS.md` is never touched.
+- Everkeep tells the assistant to read the vault's `CLAUDE.md` (or `AGENTS.md`) before it first uses the vault in a session.
+- The documentation shows how to keep the vault on its own drive: Settings > System > Storage > Add storage, Local disk (Home Assistant 2026.11 or later).
+
+### Changed
+- The `raw/` and `wiki/` folders, `log.md` and the old `CLAUDE.md` template are no longer created on a fresh install. Existing vaults are not changed.
+
+### Fixed
+- `edit_file` inserts the new text exactly as given: `$&`, `$'`, `` $` `` and `$$` in it are no longer expanded.
+
+### Security
+- A request to `/mcp` larger than 41 MiB is refused with 413 and a message to write big files in parts; before, the body was read whole, so a client with the token could fill the app's memory.
+
 ## 3.1.0 — 2026-10-27
 
 Server: everkeep 1.1.0

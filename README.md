@@ -31,7 +31,7 @@ Find **Filesystem MCP Server** in the store and select **Install**. In **Configu
 
 **3. Start**
 
-Select **Start**. On the first start the app generates a token, writes it into the `token` field and shows the connector path once in the log. Into a vault without `CLAUDE.md` it also creates a starter `CLAUDE.md`, `log.md` and a small `raw/` + `wiki/` skeleton, once.
+Select **Start**. On the first start the app generates a token, writes it into the `token` field and shows the connector path once in the log. Into a vault without `CLAUDE.md` or `AGENTS.md` it also writes a starter `CLAUDE.md` and a starter write policy, once; the assistant sets the vault up with you from there.
 
 ## Configuration
 

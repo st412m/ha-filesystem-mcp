@@ -1,6 +1,6 @@
 name: "Filesystem MCP Server"
 description: "MCP server for reading/writing files via Model Context Protocol"
-version: "3.1.0"
+version: "3.2.0"
 slug: filesystem_mcp
 url: "https://github.com/st412m/ha-filesystem-mcp"
 init: false

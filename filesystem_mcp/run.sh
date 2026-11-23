@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
 # shellcheck shell=bash
-# App options -> environment and /data/everkeep.json, the vault skeleton on the
+# App options -> environment and /data/everkeep.json, the vault setup on the
 # first start, the token, then Everkeep: MCP on port 3100, the Vault policies
 # page on port 3101 (ingress).
 
@@ -35,78 +35,46 @@ bashio::log.info "Filesystem MCP Server ${APP_VERSION} (everkeep ${EVERKEEP_VERS
 
 bashio::log.info "Vault path: ${VAULT_PATH}"
 
-# The vault skeleton is created once per installation, guarded by a flag in
-# /data that survives a container restart but not a reinstall. A vault that
-# already has CLAUDE.md is never seeded: the flag is just set, and a
-# directory deleted later stays deleted.
+# A fresh install gets what `everkeep init` writes: the root marker (edits
+# need the current rev, trash on) when the vault has none, then the starter
+# CLAUDE.md, whose text the server recognises and asks the assistant to set
+# the vault up from. Once per installation, guarded by a flag in /data that
+# survives a container restart but not a reinstall. A vault with CLAUDE.md or
+# AGENTS.md is an existing one: nothing is written, the flag is just set. A
+# step that fails is logged and the flag is not set, so the next start tries
+# again; the server starts either way.
 INIT_FLAG="/data/.vault-structure-initialized"
 
 if [ -f "${INIT_FLAG}" ]; then
-  bashio::log.info "Vault structure: already initialized, leaving the tree alone"
-elif [ -f "${VAULT_PATH}/CLAUDE.md" ]; then
-  bashio::log.info "Vault structure: existing vault detected (CLAUDE.md present) — not recreating directories"
+  bashio::log.info "Vault setup: done on an earlier start, leaving the vault alone"
+elif [ -e "${VAULT_PATH}/CLAUDE.md" ] || [ -L "${VAULT_PATH}/CLAUDE.md" ] \
+  || [ -e "${VAULT_PATH}/AGENTS.md" ] || [ -L "${VAULT_PATH}/AGENTS.md" ]; then
+  bashio::log.info "Vault setup: existing vault (instruction file present), nothing written"
   touch "${INIT_FLAG}"
 else
-  bashio::log.info "Initializing vault structure (first run)..."
-  mkdir -p "${VAULT_PATH}/raw/ha"
-  mkdir -p "${VAULT_PATH}/raw/projects"
-  mkdir -p "${VAULT_PATH}/wiki/ha/devices"
-  mkdir -p "${VAULT_PATH}/wiki/ha/automations"
-  mkdir -p "${VAULT_PATH}/wiki/ha/network"
-  mkdir -p "${VAULT_PATH}/wiki/projects"
-
-  bashio::log.info "Creating CLAUDE.md..."
-  cat > "${VAULT_PATH}/CLAUDE.md" << 'CLAUDEMD'
-# CLAUDE.md — Agent Instructions
-
-## What this is
-A personal wiki knowledge base using the Karpathy LLM wiki pattern.
-The LLM reads and writes files, the human curates sources and asks questions.
-
-## Vault structure
-
-VAULT/
-├── CLAUDE.md         # this file — read first
-├── log.md            # append-only operation log
-├── raw/              # raw source material — do not edit, only read
-│   ├── ha/
-│   └── projects/
-└── wiki/             # LLM-compiled pages
-    ├── ha/
-    │   ├── devices/      # one file per device or device group
-    │   ├── automations/  # one file per automation
-    │   └── network/      # addons, integrations, network config
-    └── projects/         # project subdirs added as needed
-
-## Rules
-
-1. Read CLAUDE.md first in every chat before working with the vault
-2. Write to wiki/ only — never modify raw/
-3. Log every operation in log.md: [date] action
-4. One file = one entity (device, automation, service, project)
-5. Use wikilinks between files: [[filename]]
-6. Never delete existing content — only append or update
-7. If a device or topic does not fit existing categories — create a new subfolder
-
-## Operations
-
-/ingest — Read raw/, compile into wiki/, update related pages, write to log.md
-/query  — Read relevant wiki/ files, answer with references to sources
-/lint   — Find: broken links, stale data, contradictions, orphan pages
-/update — Update a specific file with new data, preserve change history
-
-## MCP servers available to agent
-- **HA-MCP** — Home Assistant entities, automations, addons
-- **Keenetic-MCP** — router: clients, DHCP, Wi-Fi, VPN
-- **Vault-MCP** — read/write files in this vault
-CLAUDEMD
-
-  bashio::log.info "Creating log.md..."
-  echo "# Vault operation log" > "${VAULT_PATH}/log.md"
-  echo "" >> "${VAULT_PATH}/log.md"
-  echo "$(date -u +%Y-%m-%d) — vault initialized by Filesystem MCP Server addon" >> "${VAULT_PATH}/log.md"
-
-  touch "${INIT_FLAG}"
+  bashio::log.info "Vault setup: first start, no instruction file in ${VAULT_PATH}"
+  SETUP_OK=true
+  if ! mkdir -p "${VAULT_PATH}"; then
+    bashio::log.error "Vault setup: cannot create ${VAULT_PATH}"
+    SETUP_OK=false
+  elif [ -e "${VAULT_PATH}/.vault-policy" ] || [ -L "${VAULT_PATH}/.vault-policy" ]; then
+    bashio::log.info "Vault setup: ${VAULT_PATH}/.vault-policy exists, left as it is"
+  elif everkeep policy set . --mode rev --trash; then
+    bashio::log.info "Vault setup: root marker written (edits need the current rev, trash on)"
+  else
+    bashio::log.error "Vault setup: the root marker could not be written"
+    SETUP_OK=false
+  fi
+  if [ "${SETUP_OK}" = true ]; then
+    if node -e 'require("fs").writeFileSync(process.argv[1], require(process.argv[2]).STARTER_TEXT, { flag: "wx" })' \
+      "${VAULT_PATH}/CLAUDE.md" "${EVERKEEP_PKG}/src/starter.js"; then
+      bashio::log.info "Vault setup: starter CLAUDE.md written"
+    else
+      bashio::log.error "Vault setup: the starter CLAUDE.md could not be written"
+      SETUP_OK=false
+    fi
+  fi
+  if [ "${SETUP_OK}" = true ]; then touch "${INIT_FLAG}"; fi
 fi
 
 # Token. An empty option means Everkeep's own token in /data/token: generated

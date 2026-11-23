@@ -25,7 +25,7 @@ ENV APP_VERSION=${BUILD_VERSION}
 RUN apk add --no-cache nodejs npm poppler-utils sqlite jq \
     && mkdir -p /opt/everkeep \
     && cd /opt/everkeep \
-    && npm install --ignore-scripts --omit=optional --no-package-lock --no-save everkeep@1.1.0 \
+    && npm install --ignore-scripts --omit=optional --no-package-lock --no-save everkeep@1.2.0 \
     && ln -s /opt/everkeep/node_modules/.bin/everkeep /usr/local/bin/everkeep \
     && npm cache clean --force \
     && { rmdir /opt/everkeep/node_modules/@napi-rs 2>/dev/null || true; } \

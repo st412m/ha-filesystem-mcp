@@ -37,7 +37,7 @@ The app maps `/media` and `/share` read-write. To put files into the vault from 
 
 ## Fresh install
 
-On the first start into a vault without `CLAUDE.md`, the app creates `raw/ha`, `raw/projects`, `wiki/ha/{devices,automations,network}`, `wiki/projects`, a starter `CLAUDE.md` and `log.md`. This happens once. A directory deleted afterwards stays deleted, and an existing vault is never re-seeded.
+On the first start into a vault that has neither `CLAUDE.md` nor `AGENTS.md`, the app writes what `everkeep init` writes: a root `.vault-policy` marker (edits need the current rev, discarded files go to `.vault-trash`) unless the vault already has one, and a starter `CLAUDE.md`. Everkeep points the assistant to that file, and the assistant sets the vault up with you from there, starting with `inbox/` and `log.md`. This happens once per installation: a file removed afterwards is not written again, and a vault that already has an instruction file is never touched, including vaults set up by earlier versions of the app. Change or remove the marker on the Vault policies page.
 
 ## Vault policies page
 
